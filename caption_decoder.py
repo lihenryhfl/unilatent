@@ -89,8 +89,6 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         self.prefix_length = prefix_length
         self.prefix_inner_dim = prefix_inner_dim
 
-        if prefix_hidden_dim
-
         self.decode_prefix = (
             nn.Linear(self.prefix_inner_dim, n_embd) if self.prefix_inner_dim is not None else nn.Identity()
         )
@@ -176,7 +174,7 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
             )
             generated_tokens.append(output_tokens[0])
             generated_seq_lengths.append(seq_lengths[0])
-        generated_tokens = torch.stack(generated_tokens)
+        # generated_tokens = torch.stack(generated_tokens)
         generated_seq_lengths = torch.stack(generated_seq_lengths)
         return generated_tokens, generated_seq_lengths
 
