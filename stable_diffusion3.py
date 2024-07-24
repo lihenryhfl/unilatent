@@ -341,8 +341,6 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
         pooled_prompt_embeds = prompt_embeds[0]
 
-        # print("HEY TEXT ENCODER", text_encoder, prompt_embeds[0].shape, prompt_embeds)
-
         if clip_skip is None:
             prompt_embeds = prompt_embeds.hidden_states[-2]
         else:
@@ -359,6 +357,57 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         pooled_prompt_embeds = pooled_prompt_embeds.view(batch_size * num_images_per_prompt, -1)
 
         return prompt_embeds, pooled_prompt_embeds
+
+    def encode_prompt_clip(
+        self, 
+        prompt: Union[str, List[str]],
+        device: Optional[torch.device] = None,
+        num_images_per_prompt: int = 1,
+        clip_skip: Optional[int] = None
+    ):
+        prompt_embed, pooled_prompt_embed = self._get_clip_prompt_embeds(
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            clip_skip=clip_skip,
+            clip_model_index=0,
+        )
+        prompt_2_embed, pooled_prompt_2_embed = self._get_clip_prompt_embeds(
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            clip_skip=clip_skip,
+            clip_model_index=1,
+        )
+        clip_prompt_embeds = torch.cat([prompt_embed, prompt_2_embed], dim=-1)
+        pooled_prompt_embeds = torch.cat([pooled_prompt_embed, pooled_prompt_2_embed], dim=-1)
+
+        return clip_prompt_embeds, pooled_prompt_embeds
+
+    def format_clip_prompt_embeds(
+        self, 
+        clip_prompt_embeds: torch.FloatTensor,
+        device: Optional[torch.device] = None,
+        num_images_per_prompt: int = 1,
+        clip_skip: Optional[int] = None,
+        max_sequence_length: int = 256,
+    ):
+        B = len(clip_prompt_embeds)
+
+        t5_prompt_embed = self._get_t5_prompt_embeds(
+            prompt=[""] * B,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+            device=device,
+        )
+
+        clip_prompt_embeds = torch.nn.functional.pad(
+            clip_prompt_embeds, (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1])
+        )
+
+        prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embed], dim=-2)
+
+        return prompt_embeds
 
     def encode_prompt(
         self,
@@ -965,6 +1014,9 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         return noisy_sample, self.scheduler.timesteps[index].to(sample.device).type(sample.dtype), target
 
     def encode_image(self, x, device='cpu', dtype=torch.float32):
+        """
+        Embeds image x into a shared latent variable z.
+        """
         if x.min() < 0:
             assert x.min() >= -1.
             x = x * .5 + .5
@@ -972,6 +1024,17 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         processed_list = self.clip_image_processor(x, do_rescale=False)['pixel_values']
         z = torch.tensor(np.stack(processed_list)).to(device).type(dtype)
         return self.clip_image_encoder(z).last_hidden_state
+
+    def encode_text(self, x, device='cpu', dtype=torch.float32):
+        """
+        Embeds text x into a shared latent variable z. 
+        """
+        (
+            prompt_embeds,
+            pooled_prompt_embeds
+        ) = pipe.encode_prompt_clip(prompt=batch[1])
+
+        return prompt_embeds, pooled_prompt_embeds
 
     def decode_loss(self, image, prompt, device, dtype):
         image_embd = self.encode_image(image, device=device, dtype=dtype)
@@ -994,7 +1057,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         llm_out = self.text_decoder.forward(input_ids, image_embd, attention_mask=mask)
         return llm_out.loss
         
-    def train_step(self, image, prompt, index, noise=None):
+    def diffusion_step(self, image, prompt, index, noise=None):
         latent = self.vae.encode(image).latent_dist.sample()
         latent = (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 

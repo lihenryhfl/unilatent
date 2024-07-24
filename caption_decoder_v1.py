@@ -9,6 +9,8 @@ from transformers.modeling_utils import ModuleUtilsMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models import ModelMixin
 
+from utils import ReLength
+
 
 # Modified from ClipCaptionModel in https://github.com/thu-ml/unidiffuser/blob/main/libs/caption_decoder.py
 class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
@@ -89,6 +91,10 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         self.prefix_length = prefix_length
         self.prefix_inner_dim = prefix_inner_dim # in the future change this to input dim to be more clear
         self.prefix_hidden_dim = prefix_hidden_dim if prefix_hidden_dim is not None else prefix_inner_dim
+
+        # prefix_len = embed_len + pooled_embed_len
+        self.relength = ReLength((prefix_length - 1) * 2, prefix_inner_dim // 2, 16) # for embed
+        self.pooled_relength = ReLength(2, prefix_inner_dim // 2, 16) # for pooled_embed
 
         if self.prefix_inner_dim != self.prefix_hidden_dim:
             self.encode_prefix = (
