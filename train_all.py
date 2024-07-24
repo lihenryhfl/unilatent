@@ -89,7 +89,10 @@ dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=
 
 num_epochs = 2
 
-optimizer = torch.optim.AdamW(lr=1e-4, params=pipe.parameters(models=[pipe.text_decoder]))
+# models = [pipe.text_decoder]
+models = [pipe.transformer]
+
+optimizer = torch.optim.AdamW(lr=1e-4, params=pipe.parameters(models=models))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=100,
@@ -99,17 +102,35 @@ lr_scheduler = get_cosine_schedule_with_warmup(
 for p in pipe.parameters():
     p.requires_grad = False
 
-for p in pipe.parameters(models=[pipe.text_decoder]):
+for p in pipe.parameters(models=models):
     p.requires_grad = True
+
+for p in pipe.text_decoder.relength.parameters():
+    p.requires_grad = False
+
+for p in pipe.text_decoder.pooled_relength.parameters():
+    p.requires_grad = False
 
 accelerator = Accelerator(
         mixed_precision='fp16',
         # gradient_accumulation_steps=config.gradient_accumulation_steps
     )
 
-pipe.transformer, optimizer, lr_scheduler = accelerator.prepare(pipe.transformer, optimizer, lr_scheduler)
-pipe.text_encoder, pipe.text_encoder_2 = accelerator.prepare(pipe.text_encoder, pipe.text_encoder_2)
-pipe.clip_image_encoder, pipe.text_decoder = accelerator.prepare(pipe.clip_image_encoder, pipe.text_decoder)
+def prepare(accelerator, pipe, inplace=True):
+    return_dict = pipe.components if inplace else {}
+    for name in pipe.components:
+        return_dict[name] = accelerator.prepare(pipe.components[name])
+
+    return return_dict
+
+def unwrap(accelerator, pipe, inplace=True):
+    return_dict = pipe.components if inplace else {}
+    for name in pipe.components:
+        return_dict[name] = accelerator.unwrap_model(pipe.components[name])
+
+    return return_dict
+
+prepare(accelerator, pipe)
 
 for epoch in range(num_epochs):
     # progbar = tqdm(dataloader, mininterval=30, disable=not accelerator.is_main_process)
@@ -123,8 +144,13 @@ for epoch in range(num_epochs):
         index = torch.randint(0, 1000, size=(len(image),))
 
         # run model
-        loss = pipe.decode_loss(image, prompt, device=accelerator.device, dtype=torch.float16)
-        # prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt, device=accelerator.device, dtype=torch.float16)
+        prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt, device=accelerator.device, dtype=torch.float16)
+        prompt_embeds = pipe.format_clip_prompt_embeds(prompt_embeds)
+        model_output, target = pipe.embed_to_denoiser(image, prompt_embeds, pooled_prompt_embeds, index, device=accelerator.device, dtype=torch.float16)
+        loss = ((model_output - target) ** 2).mean()
+        # loss = pipe.embed_to_decoder(prompt_embeds, pooled_prompt_embeds, prompt, device=accelerator.device, dtype=torch.float16)
+        # image_embeds, pooled_image_embeds = pipe.encode_image(image, device=accelerator.device, dtype=torch.float16)
+        # loss = pipe.embed_to_decoder(image_embeds, pooled_image_embeds, prompt, device=accelerator.device, dtype=torch.float16)
         accelerator.backward(loss)
 
         grad_norm = accelerator.clip_grad_norm_(pipe.parameters(), 0.01)
@@ -138,11 +164,9 @@ for epoch in range(num_epochs):
         
         progbar.set_description(f"loss: {loss.item():.3f}")
 
-        if accelerator.is_main_process and ((step + 1) % 2500 == 0 or step == 10):
-            text_decoder = accelerator.unwrap_model(pipe.text_decoder)
-            text_decoder.transformer.lm_head.weight = None
-            text_decoder.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/text_decoder/')
-            text_decoder.transformer.lm_head.weight = text_decoder.transformer.transformer.wte.weight
+        if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
+            if (step + 1) % 2500 == 0 or step == 10:
+                pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
 
             embed, pooled_embed = pipe.encode_image(image[:1], device=accelerator.device, dtype=torch.float16)
             embed = torch.cat([embed, pooled_embed], axis=1)
