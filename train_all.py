@@ -64,16 +64,16 @@ pipe = UniLatentPipeline(
 data_config = {
     'type': 'FlexibleInternalDataMS',
     'roots': [
-        '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
-        # '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
-        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
+        # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
+        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
+        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
         # '/mnt/bn/aigc-us/zjl/openimages/data/',
         # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
     ],
     'json_lst': [
-        '/mnt/bn/us-aigc-temp/henry/test.json',
-        # '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco.json',
-        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json'
+        # '/mnt/bn/us-aigc-temp/henry/test.json',
+        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
+        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json'
     ],
     'load_vae_feat': False,
     'load_t5_feat': False
@@ -145,8 +145,10 @@ for epoch in range(num_epochs):
 
         # run model
         prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt, device=accelerator.device, dtype=torch.float16)
-        prompt_embeds = pipe.format_clip_prompt_embeds(prompt_embeds)
-        model_output, target = pipe.embed_to_denoiser(image, prompt_embeds, pooled_prompt_embeds, index, device=accelerator.device, dtype=torch.float16)
+        # prompt_embeds = pipe.format_clip_prompt_embeds(prompt_embeds)
+        # model_output, target = pipe.embed_to_denoiser(image, prompt_embeds, pooled_prompt_embeds, index, device=accelerator.device, dtype=torch.float16)
+        model_output, target = pipe.diffusion_step(image, prompt, index)
+        
         loss = ((model_output - target) ** 2).mean()
         # loss = pipe.embed_to_decoder(prompt_embeds, pooled_prompt_embeds, prompt, device=accelerator.device, dtype=torch.float16)
         # image_embeds, pooled_image_embeds = pipe.encode_image(image, device=accelerator.device, dtype=torch.float16)
@@ -165,13 +167,13 @@ for epoch in range(num_epochs):
         progbar.set_description(f"loss: {loss.item():.3f}")
 
         if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
-            if (step + 1) % 2500 == 0 or step == 10:
+            if (step + 1) % 500 == 0 or step == 10:
                 pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
+                print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 
-            embed, pooled_embed = pipe.encode_image(image[:1], device=accelerator.device, dtype=torch.float16)
+            embed, pooled_embed = pipe.encode_image(image[:1])
             embed = torch.cat([embed, pooled_embed], axis=1)
-            generate_captions = pipe.text_decoder.module.generate_captions if isinstance(pipe.text_decoder, DDP) else pipe.text_decoder.generate_captions
-            decoded_tokens = generate_captions(embed, 
+            decoded_tokens = pipe.text_decoder.generate_captions(embed, 
                                 eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
             decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
             print(decoded_text)

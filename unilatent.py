@@ -209,6 +209,9 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         decoder_tokenizer: GPT2Tokenizer,# = None,
     ):
         super().__init__()
+        
+        # for warning about truncation errors with CLIP
+        self.num_warnings = 5
 
         if clip_image_encoder is not None:
             assert clip_image_processor is not None
@@ -306,7 +309,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         print(super(cls, cls), args, kwargs)
-        model = super(cls, cls).from_pretrained(*args, **kwargs)
+        model = super(cls, cls).from_pretrained(*args, low_cpu_mem_usage=False, device_map=None, **kwargs)
         assert model.text_decoder.transformer.transformer.wte.weight is not None
         model.text_decoder.transformer.lm_head.weight = model.text_decoder.transformer.transformer.wte.weight
         assert model.text_decoder.transformer.lm_head.weight is not None
@@ -342,11 +345,13 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         text_input_ids = text_inputs.input_ids
         untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
         if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = tokenizer.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
-            logger.warning(
-                "The following part of your input was truncated because CLIP can only handle sequences up to"
-                f" {self.tokenizer_max_length} tokens: {removed_text}, orig: {prompt}"
-            )
+            if self.num_warnings > 0:
+                self.num_warnings -= 1
+                removed_text = tokenizer.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+                logger.warning(
+                    "The following part of your input was truncated because CLIP can only handle sequences up to"
+                    f" {self.tokenizer_max_length} tokens: {removed_text}, orig: {prompt}"
+                )
         prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
         pooled_prompt_embeds = prompt_embeds[0]
 
@@ -1021,7 +1026,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         
         return noisy_sample, self.scheduler.timesteps[index].to(sample.device).type(sample.dtype), target
 
-    def encode_image(self, x, device='cpu', dtype=torch.float32):
+    def encode_image(self, x, dtype=torch.float32):
         """
         Embeds image x into a shared latent variable z.
         """
@@ -1030,7 +1035,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             x = x * .5 + .5
         
         processed_list = self.clip_image_processor(x, do_rescale=False)['pixel_values']
-        z = torch.tensor(np.stack(processed_list)).to(device).type(dtype)
+        z = torch.tensor(np.stack(processed_list)).to(self.device).type(dtype)
         result = self.clip_image_encoder(z)
         image_embed, pooled_image_embed = result.last_hidden_state, result.pooler_output
 
@@ -1046,7 +1051,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         return image_embed, pooled_image_embed
 
-    def encode_text(self, x, device='cpu', dtype=torch.float32):
+    def encode_text(self, x):
         """
         Embeds text x into a shared latent variable z. 
         """
@@ -1057,7 +1062,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         return prompt_embeds, pooled_prompt_embeds
 
-    def embed_to_decoder(self, embed, pooled_embed, prompt, device, dtype):
+    def embed_to_decoder(self, embed, pooled_embed, prompt):
         assert (embed.shape[1] + 1) == self.text_decoder.prefix_length, embed.shape
         B, N, C = embed.shape
         joint_embed = torch.cat([embed, pooled_embed.reshape(B, 1, C)], axis=1)
@@ -1065,23 +1070,26 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         processed_prompt = [self.decoder_tokenizer.bos_token + txt + self.decoder_tokenizer.eos_token for txt in prompt]
         tokens = self.decoder_tokenizer(processed_prompt, return_tensors='pt', truncation=True, 
                                      max_length=120, padding="longest")
-        mask = pad_mask(tokens['attention_mask'], prefix_len=self.text_decoder.prefix_length).to(device)
-        input_ids = tokens['input_ids'].to(device)
+        mask = pad_mask(tokens['attention_mask'], prefix_len=self.text_decoder.prefix_length).to(self.device)
+        input_ids = tokens['input_ids'].to(self.device)
 
         llm_out = self.text_decoder.forward(input_ids, joint_embed, attention_mask=mask)
 
         return llm_out.loss
 
-    def decode_loss(self, image, prompt, device, dtype):
-        image_embed, pooled_image_embed = self.encode_image(image, device=device, dtype=dtype)
+    def decode_loss(self, image, prompt):
+        image_embed, pooled_image_embed = self.encode_image(image, device=self.device)
         
-        return self.embed_to_decoder(image_embed, pooled_image_embed, prompt, device=device, dtype=dtype)
+        return self.embed_to_decoder(image_embed, pooled_image_embed, prompt, device=self.device)
 
-    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, device, dtype):
-        latent = self.vae.encode(image.to(device)).latent_dist.sample()
+    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index):
+        latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
         latent = (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
         noise = torch.randn_like(latent)
+
+        # format prompt_embeds correctly
+        prompt_embeds = self.format_clip_prompt_embeds(prompt_embeds)
         
         noisy_latent, timestep, target = self._scale_noise(latent, index, noise)
         model_output = self.transformer(
@@ -1095,7 +1103,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         return model_output, target
         
-    def diffusion_step(self, image, prompt, index, device, dtype):
+    def diffusion_step(self, image, prompt, index):
         prompt_embeds = pooled_prompt_embeds = None # for now, may be useful in the future
         max_sequence_length = 77 # also for now
         (
@@ -1110,7 +1118,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             do_classifier_free_guidance=False,
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
-            device=device,
+            device=self.device,
             clip_skip=None,
             num_images_per_prompt=1,
             max_sequence_length=max_sequence_length,
