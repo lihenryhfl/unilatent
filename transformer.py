@@ -24,13 +24,27 @@ from diffusers.models.attention import JointTransformerBlock
 from diffusers.models.attention_processor import Attention, AttentionProcessor
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNormContinuous
-from diffusers.utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_lora_layers, unscale_lora_layers
+from diffusers.utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_lora_layers, unscale_lora_layers, BaseOutput
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
+from dataclasses import dataclass
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+@dataclass
+class CustomTransformer2DModelOutput(BaseOutput):
+    """
+    The output of [`Transformer2DModel`].
+
+    Args:
+        sample (`torch.Tensor` of shape `(batch_size, num_channels, height, width)` or `(batch size, num_vector_embeds - 1, num_latent_pixels)` if [`Transformer2DModel`] is discrete):
+            The hidden states output conditioned on the `encoder_hidden_states` input. If discrete, returns probability
+            distributions for the unnoised latent pixels.
+    """
+
+    sample: torch.Tensor  # noqa: F821
+    hidden: torch.Tensor = None
 
 class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
     """
@@ -248,7 +262,8 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         block_controlnet_hidden_states: List = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-    ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
+        return_layer: int = None,
+    ) -> Union[torch.FloatTensor, CustomTransformer2DModelOutput]:
         """
         The [`SD3Transformer2DModel`] forward method.
 
@@ -296,6 +311,8 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         temb = self.time_text_embed(timestep, pooled_projections)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
+        return_hidden = None
+
         for index_block, block in enumerate(self.transformer_blocks):
             if self.training and self.gradient_checkpointing:
 
@@ -321,6 +338,9 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states, temb=temb
                 )
+
+            if return_layer is not None and index_block == return_layer:
+                return_hidden = encoder_hidden_states, hidden_states
 
             # controlnet residual
             if block_controlnet_hidden_states is not None and block.context_pre_only is False:
@@ -350,4 +370,4 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         if not return_dict:
             return (output,)
 
-        return Transformer2DModelOutput(sample=output)
+        return CustomTransformer2DModelOutput(sample=output, hidden=return_hidden)

@@ -307,7 +307,6 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
-        print(super(cls, cls), args, kwargs)
         model = super(cls, cls).from_pretrained(*args, low_cpu_mem_usage=False, device_map=None, **kwargs)
         assert model.text_decoder.transformer.transformer.wte.weight is not None
         model.text_decoder.transformer.lm_head.weight = model.text_decoder.transformer.transformer.wte.weight
@@ -587,8 +586,6 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             negative_pooled_prompt_embeds = torch.cat(
                 [negative_pooled_prompt_embed, negative_pooled_prompt_2_embed], dim=-1
             )
-
-        # print(f"PROMPT_EMBED SHAPES: prompt_embeds: {prompt_embeds.shape}, pooled_prompt_embeds: {pooled_prompt_embeds.shape}")
 
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
@@ -1083,7 +1080,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         
         return self.embed_to_decoder(image_embed, pooled_image_embed, prompt)
 
-    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index):
+    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, return_layer=None):
         latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
         latent = (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
@@ -1101,31 +1098,16 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
                     encoder_hidden_states=prompt_embeds,
                     pooled_projections=pooled_prompt_embeds,
                     joint_attention_kwargs=None,
-                    return_dict=False,
-                )[0]
+                    return_layer=return_layer
+                )
 
-        return model_output, target
+        if return_layer:
+            return model_output.sample, model_output.hidden, target
+
+        return model_output.sample, target
         
     def diffusion_step(self, image, prompt, index):
-        prompt_embeds = pooled_prompt_embeds = None # for now, may be useful in the future
-        max_sequence_length = 77 # also for now
-        (
-            prompt_embeds,
-            negative_prompt_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
-        ) = self.encode_prompt(
-            prompt=prompt,
-            prompt_2=None,
-            prompt_3=None,
-            do_classifier_free_guidance=False,
-            prompt_embeds=prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            device=self.device,
-            clip_skip=None,
-            num_images_per_prompt=1,
-            max_sequence_length=max_sequence_length,
-        )
+        prompt_embeds, pooled_prompt_embeds = self.encode_text(prompt)
 
         return self.embed_to_denoiser(image, prompt_embeds, pooled_prompt_embeds, index)
 
@@ -1151,5 +1133,20 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             for n, p in model.named_parameters():
                 parameters.append((n, p))
 
-        print('PARAMS', [n for n, p in parameters])
         return parameters
+
+
+######################## FOR DIFT #########################
+    def dift_features(self, image, index, return_layer=4):
+        prompt_embeds, pooled_prompt_embeds = self.encode_text("")
+        
+        _, (_, hidden), _ = self.embed_to_denoiser(
+            image,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            index,
+            return_layer=return_layer)
+
+        hidden = hidden[:, :512]
+        # basic conversion to work with our framework
+        return hidden[:, :-1], hidden[:, -1:]

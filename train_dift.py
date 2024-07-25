@@ -20,11 +20,15 @@ from transformers import (
 
 # from caption_decoder import TextDecoder
 from caption_decoder_v1 import TextDecoder
+from utils import ReLength
+
 from transformer import SD3Transformer2DModel
 
 parser = argparse.ArgumentParser(description="Training.")
 parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2text/', help='the dir to save logs and models')
 parser.add_argument('--batch_size', type=int, default=48)
+parser.add_argument('--block_num', type=int, default=4)
+parser.add_argument('--index', type=int, default=500)
 args = parser.parse_args()
 
 pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float32)
@@ -38,7 +42,11 @@ pipe.decoder_tokenizer = decoder_tokenizer
 # # slightly hacky -- cannot save wte weights since they are shared with lm_head, so we copy them back here
 # text_decoder.transformer.transformer.wte.weight = text_decoder.transformer.lm_head.weight
 # text_decoder.decode_prefix = torch.nn.Linear(1024, 768)
-text_decoder = TextDecoder(prefix_length=78, prefix_inner_dim=2048, prefix_hidden_dim=2048, vocab_size=decoder_tokenizer.vocab_size + 1)
+text_decoder = TextDecoder(
+    prefix_length=512,
+    prefix_inner_dim=1536,
+    prefix_hidden_dim=1536,
+    vocab_size=decoder_tokenizer.vocab_size + 1)
 pipe.text_decoder = text_decoder
 
 pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
@@ -71,14 +79,14 @@ data_config = {
     'roots': [
         # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
         '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
-        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
+        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
         # '/mnt/bn/aigc-us/zjl/openimages/data/',
         # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
     ],
     'json_lst': [
         # '/mnt/bn/us-aigc-temp/henry/test.json',
         '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
-        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json'
+        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json'
     ],
     'load_vae_feat': False,
     'load_t5_feat': False
@@ -94,8 +102,8 @@ dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=
 
 num_epochs = 2
 
-# models = [pipe.text_decoder]
-models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
+models = [pipe.text_decoder]
+# models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
 
 optimizer = torch.optim.AdamW(lr=1e-4, params=pipe.parameters(models=models))
 lr_scheduler = get_cosine_schedule_with_warmup(
@@ -153,6 +161,8 @@ def truncate(texts):
     pipe.vae
 )
 
+print(f"TOTAL TRANSFORMER LAYERS: {len(pipe.transformer.transformer_blocks)} | OUR CHOSEN BLOCK: {args.block_num}")
+
 for epoch in range(num_epochs):
     # progbar = tqdm(dataloader, mininterval=30, disable=not accelerator.is_main_process)
     progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
@@ -162,24 +172,13 @@ for epoch in range(num_epochs):
         # prepare data
         image, prompt = batch[0].to('cuda'), truncate(batch[1])
         batch[1] = [x.strip('<|endoftext|>') for x in batch[1]]
-        index = torch.randint(0, 1000, size=(len(image) * 2,))
+        # index = torch.randint(0, 1000, size=(len(image) * 2,))
+        index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
 
         # run model
-        prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt)
-        image_embeds, pooled_image_embeds = pipe.encode_image(image, dtype=torch.float16)
-
-        embeds = torch.cat([prompt_embeds, image_embeds], axis=0)
-        pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds], axis=0)
-        image = torch.cat([image, image], axis=0)
-        prompt = prompt + prompt
-
-        loss = 0.
-
-        model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
-        loss += ((model_output - target) ** 2).mean()
+        embeds, pooled_embeds = pipe.dift_features(image, index, return_layer=args.block_num)
 
         loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
-        # loss += pipe.embed_to_decoder(image_embeds, pooled_image_embeds, prompt)
         accelerator.backward(loss)
 
         grad_norm = accelerator.clip_grad_norm_(pipe.parameters(), 0.01)
@@ -198,7 +197,8 @@ for epoch in range(num_epochs):
                 pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
                 print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 
-            embeds, pooled_embeds = pipe.encode_image(image[:1])
+            val_index = index = torch.zeros(size=(1,), dtype=torch.long) + args.index
+            embeds, pooled_embeds = pipe.dift_features(image[:1], val_index)
             embeds = torch.cat([embeds, pooled_embeds], axis=1)
             decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
                                 eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
