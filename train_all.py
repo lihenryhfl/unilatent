@@ -97,7 +97,7 @@ num_epochs = 2
 # models = [pipe.text_decoder]
 models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
 
-optimizer = torch.optim.AdamW(lr=1e-4, params=pipe.parameters(models=models))
+optimizer = torch.optim.AdamW(lr=2e-5, params=pipe.parameters(models=models))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=100,
@@ -178,7 +178,7 @@ for epoch in range(num_epochs):
         model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
         loss += ((model_output - target) ** 2).mean()
 
-        loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+        loss += pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
         # loss += pipe.embed_to_decoder(image_embeds, pooled_image_embeds, prompt)
         accelerator.backward(loss)
 
@@ -198,10 +198,15 @@ for epoch in range(num_epochs):
                 pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
                 print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 
-            embeds, pooled_embeds = pipe.encode_image(image[:1])
+            embeds = torch.cat([prompt_embeds[:1], image_embeds[:1]])
+            pooled_embeds = torch.cat([pooled_prompt_embeds[:1], pooled_image_embeds[:1]])
             embeds = torch.cat([embeds, pooled_embeds], axis=1)
             decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
                                 eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
             decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
-            print(decoded_text)
+            print(
+                f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace(' <|EOS|>', '')} \n"
+                f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace(' <|EOS|>', '')} \n"
+                f"True: {batch[1][0]}"
+            )
     

@@ -192,16 +192,17 @@ for epoch in range(num_epochs):
         
         progbar.set_description(f"loss: {loss.item():.3f}")
 
-        if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
-            if (step + 1) % 2500 == 0 or step == 10:
+        if accelerator.is_main_process and ((step + 1) % 2500 == 0 or step == 10):
+            if (step + 1) % 10000 == 0 or step == 10:
                 pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
                 print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 
-            val_index = index = torch.zeros(size=(1,), dtype=torch.long) + args.index
-            embeds, pooled_embeds = pipe.dift_features(image[:1], val_index)
-            embeds = torch.cat([embeds, pooled_embeds], axis=1)
+            embeds = torch.cat([embeds[:1], pooled_embeds[:1]], axis=1)
             decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
                                 eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
             decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
-            print(decoded_text)
+            print(
+                f"Recon: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace(' <|EOS|>', '')} | "
+                f"True: {batch[1][0]}"
+            )
     

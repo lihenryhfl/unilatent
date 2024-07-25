@@ -1,7 +1,7 @@
 torch
 torchaudio
 torchvision
-mmcv=1.7.0
+mmcv==1.7.0
 diffusers
 timm
 accelerate
