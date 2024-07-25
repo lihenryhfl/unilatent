@@ -90,7 +90,7 @@ dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=
 num_epochs = 2
 
 # models = [pipe.text_decoder]
-models = [pipe.transformer]
+models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
 
 optimizer = torch.optim.AdamW(lr=1e-4, params=pipe.parameters(models=models))
 lr_scheduler = get_cosine_schedule_with_warmup(
@@ -105,32 +105,32 @@ for p in pipe.parameters():
 for p in pipe.parameters(models=models):
     p.requires_grad = True
 
-for p in pipe.text_decoder.relength.parameters():
-    p.requires_grad = False
+# for p in pipe.text_decoder.relength.parameters():
+#     p.requires_grad = False
 
-for p in pipe.text_decoder.pooled_relength.parameters():
-    p.requires_grad = False
+# for p in pipe.text_decoder.pooled_relength.parameters():
+#     p.requires_grad = False
 
 accelerator = Accelerator(
         mixed_precision='fp16',
         # gradient_accumulation_steps=config.gradient_accumulation_steps
     )
 
-def prepare(accelerator, pipe, inplace=True):
-    return_dict = pipe.components if inplace else {}
-    for name in pipe.components:
-        return_dict[name] = accelerator.prepare(pipe.components[name])
+def truncate(texts):
+    texts = pipe.tokenizer.batch_decode(pipe.tokenizer(
+        texts,
+        padding="max_length",
+        max_length=77 - 3,
+        truncation=True,
+        return_tensors="pt",
+    ).input_ids)
+    texts = [x.replace('<|endoftext|>', '').replace('<|startoftext|>', '') for x in texts]
 
-    return return_dict
+    return texts
 
-def unwrap(accelerator, pipe, inplace=True):
-    return_dict = pipe.components if inplace else {}
-    for name in pipe.components:
-        return_dict[name] = accelerator.unwrap_model(pipe.components[name])
-
-    return return_dict
-
-prepare(accelerator, pipe)
+pipe.transformer, optimizer, lr_scheduler = accelerator.prepare(pipe.transformer, optimizer, lr_scheduler)
+pipe.text_encoder, pipe.text_encoder_2 = accelerator.prepare(pipe.text_encoder, pipe.text_encoder_2)
+pipe.clip_image_encoder, pipe.text_decoder = accelerator.prepare(pipe.clip_image_encoder, pipe.text_decoder)
 
 for epoch in range(num_epochs):
     # progbar = tqdm(dataloader, mininterval=30, disable=not accelerator.is_main_process)
@@ -139,20 +139,26 @@ for epoch in range(num_epochs):
         optimizer.zero_grad()
         
         # prepare data
-        image, prompt = batch[0].to('cuda'), batch[1]
+        image, prompt = batch[0].to('cuda'), truncate(batch[1])
         batch[1] = [x.strip('<|endoftext|>') for x in batch[1]]
-        index = torch.randint(0, 1000, size=(len(image),))
+        index = torch.randint(0, 1000, size=(len(image) * 2,))
 
         # run model
-        prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt, device=accelerator.device, dtype=torch.float16)
-        # prompt_embeds = pipe.format_clip_prompt_embeds(prompt_embeds)
-        # model_output, target = pipe.embed_to_denoiser(image, prompt_embeds, pooled_prompt_embeds, index, device=accelerator.device, dtype=torch.float16)
-        model_output, target = pipe.diffusion_step(image, prompt, index)
-        
-        loss = ((model_output - target) ** 2).mean()
-        # loss = pipe.embed_to_decoder(prompt_embeds, pooled_prompt_embeds, prompt, device=accelerator.device, dtype=torch.float16)
-        # image_embeds, pooled_image_embeds = pipe.encode_image(image, device=accelerator.device, dtype=torch.float16)
-        # loss = pipe.embed_to_decoder(image_embeds, pooled_image_embeds, prompt, device=accelerator.device, dtype=torch.float16)
+        prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt)
+        image_embeds, pooled_image_embeds = pipe.encode_image(image, dtype=torch.float16)
+
+        embeds = torch.cat([prompt_embeds, image_embeds], axis=0)
+        pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds], axis=0)
+        image = torch.cat([image, image], axis=0)
+        prompt = prompt + prompt
+
+        loss = 0.
+
+        model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
+        loss += ((model_output - target) ** 2).mean()
+
+        loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+        # loss += pipe.embed_to_decoder(image_embeds, pooled_image_embeds, prompt)
         accelerator.backward(loss)
 
         grad_norm = accelerator.clip_grad_norm_(pipe.parameters(), 0.01)

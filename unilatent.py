@@ -20,8 +20,6 @@ import numpy as np
 from transformers import (
     CLIPTextModelWithProjection,
     CLIPTokenizer,
-    T5EncoderModel,
-    T5TokenizerFast,
     CLIPVisionModel,
     CLIPImageProcessor,
     GPT2Tokenizer
@@ -33,9 +31,10 @@ from caption_decoder_v1 import TextDecoder
 from utils import pad_mask
 
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.loaders import FromSingleFileMixin, SD3LoraLoaderMixin
+from diffusers.loaders import FromSingleFileMixin
 from diffusers.models.autoencoders import AutoencoderKL
-from diffusers.models.transformers import SD3Transformer2DModel
+# from diffusers.models.transformers import SD3Transformer2DModel
+from transformer import SD3Transformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (
     is_torch_xla_available,
@@ -1060,7 +1059,9 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             pooled_prompt_embeds
         ) = self.encode_prompt_clip(prompt=x)
 
-        return prompt_embeds, pooled_prompt_embeds
+        B, N, C = prompt_embeds.shape
+
+        return prompt_embeds, pooled_prompt_embeds.reshape(B, 1, C)
 
     def embed_to_decoder(self, embed, pooled_embed, prompt):
         assert (embed.shape[1] + 1) == self.text_decoder.prefix_length, embed.shape
@@ -1078,9 +1079,9 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         return llm_out.loss
 
     def decode_loss(self, image, prompt):
-        image_embed, pooled_image_embed = self.encode_image(image, device=self.device)
+        image_embed, pooled_image_embed = self.encode_image(image)
         
-        return self.embed_to_decoder(image_embed, pooled_image_embed, prompt, device=self.device)
+        return self.embed_to_decoder(image_embed, pooled_image_embed, prompt)
 
     def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index):
         latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
@@ -1089,7 +1090,9 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         noise = torch.randn_like(latent)
 
         # format prompt_embeds correctly
+        B, N, C = prompt_embeds.shape
         prompt_embeds = self.format_clip_prompt_embeds(prompt_embeds)
+        pooled_prompt_embeds = pooled_prompt_embeds.reshape(B, C)
         
         noisy_latent, timestep, target = self._scale_noise(latent, index, noise)
         model_output = self.transformer(
@@ -1148,4 +1151,5 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             for n, p in model.named_parameters():
                 parameters.append((n, p))
 
+        print('PARAMS', [n for n, p in parameters])
         return parameters

@@ -62,14 +62,14 @@ pipe = UniLatentPipeline.from_pretrained('/mnt/bn/us-aigc-temp/henry/data/clip_t
 data_config = {
     'type': 'FlexibleInternalDataMS',
     'roots': [
-        #'/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
-        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
+        '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
+        # '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
         # '/mnt/bn/aigc-us/zjl/openimages/data/',
         # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
     ],
     'json_lst': [
-        #'/mnt/bn/us-aigc-temp/henry/test.json',
-        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco.json'
+        '/mnt/bn/us-aigc-temp/henry/test.json',
+        # '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco.json'
     ],
     'load_vae_feat': False,
     'load_t5_feat': False
