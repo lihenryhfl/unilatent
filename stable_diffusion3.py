@@ -29,7 +29,7 @@ from transformers import (
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from caption_decoder import TextDecoder
+from unilatent.caption_decoder_v2 import TextDecoder
 from utils import pad_mask
 
 from diffusers.image_processor import VaeImageProcessor

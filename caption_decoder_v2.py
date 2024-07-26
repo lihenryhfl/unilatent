@@ -9,6 +9,7 @@ from transformers.modeling_utils import ModuleUtilsMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models import ModelMixin
 
+from utils import ReLength
 
 # Modified from ClipCaptionModel in https://github.com/thu-ml/unidiffuser/blob/main/libs/caption_decoder.py
 class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
@@ -87,11 +88,34 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         super().__init__()
 
         self.prefix_length = prefix_length
-        self.prefix_inner_dim = prefix_inner_dim
+        self.prefix_inner_dim = prefix_inner_dim # in the future change this to input dim to be more clear
+        self.prefix_hidden_dim = prefix_hidden_dim if prefix_hidden_dim is not None else prefix_inner_dim
 
-        self.decode_prefix = (
-            nn.Linear(self.prefix_inner_dim, n_embd) if self.prefix_inner_dim is not None else nn.Identity()
-        )
+        # prefix_len = embed_len + pooled_embed_len
+        self.relength = ReLength(prefix_length - 1, prefix_inner_dim, 16) # for embed
+        self.pooled_relength = ReLength(1, prefix_inner_dim, 16) # for pooled_embed
+
+        self.image_embedder = nn.Linear(prefix_inner_dim, prefix_inner_dim)
+        self.pooled_image_embedder = nn.Linear(prefix_inner_dim, prefix_inner_dim)
+
+        nn.init.constant_(self.image_embedder.weight, 0)
+        nn.init.constant_(self.image_embedder.bias, 0)
+        nn.init.constant_(self.pooled_image_embedder.weight, 0)
+        nn.init.constant_(self.pooled_image_embedder.bias, 0)
+
+        if self.prefix_inner_dim != self.prefix_hidden_dim:
+            self.encode_prefix = (
+                nn.Linear(self.prefix_inner_dim, self.prefix_hidden_dim) if self.prefix_inner_dim is not None else nn.Identity()
+            )
+            self.decode_prefix = (
+                nn.Linear(self.prefix_hidden_dim, n_embd) if self.prefix_inner_dim is not None else nn.Identity()
+            )
+        else:
+            self.encode_prefix = nn.Identity()
+
+            self.decode_prefix = (
+                nn.Linear(self.prefix_hidden_dim, n_embd) if self.prefix_inner_dim is not None else nn.Identity()
+            )
 
         gpt_config = GPT2Config(
             vocab_size=vocab_size,
@@ -132,9 +156,8 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
                 Labels to use for language modeling.
         """
         embedding_text = self.transformer.transformer.wte(input_ids)
-        # hidden = self.encode_prefix(prefix_embeds)
-        # prefix_embeds = self.decode_prefix(hidden)
-        prefix_embeds = self.decode_prefix(prefix_embeds)
+        hidden = self.encode_prefix(prefix_embeds)
+        prefix_embeds = self.decode_prefix(hidden)
         embedding_cat = torch.cat((prefix_embeds, embedding_text), dim=1)
 
         if labels is None:
@@ -167,10 +190,12 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         generated_tokens = []
         generated_seq_lengths = []
         for feature in features:
-            feature = self.decode_prefix(feature.to(device))  # back to the clip feature
+            # prefix_embeds = self.decode_prefix(feature.to(device))  # back to the clip feature
+            hidden = self.encode_prefix(feature.to(device))
+            prefix_embeds = self.decode_prefix(hidden)
             # Only support beam search for now
             output_tokens, seq_lengths = self.generate_beam(
-                input_embeds=feature, device=device, eos_token_id=eos_token_id
+                input_embeds=prefix_embeds, device=device, eos_token_id=eos_token_id
             )
             generated_tokens.append(output_tokens[0])
             generated_seq_lengths.append(seq_lengths[0])

@@ -172,7 +172,6 @@ for epoch in range(num_epochs):
         # prepare data
         image, prompt = batch[0].to('cuda'), truncate(batch[1])
         batch[1] = [x.strip('<|endoftext|>') for x in batch[1]]
-        # index = torch.randint(0, 1000, size=(len(image) * 2,))
         index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
 
         # run model
@@ -192,8 +191,8 @@ for epoch in range(num_epochs):
         
         progbar.set_description(f"loss: {loss.item():.3f}")
 
-        if accelerator.is_main_process and ((step + 1) % 2500 == 0 or step == 10):
-            if (step + 1) % 10000 == 0 or step == 10:
+        if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
+            if (step + 1) % 5000 == 0 or step == 10:
                 pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
                 print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 

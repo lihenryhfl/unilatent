@@ -18,7 +18,7 @@ from transformers import (
     CLIPImageProcessor,
 )
 
-from caption_decoder import TextDecoder
+from unilatent.caption_decoder_v2 import TextDecoder
 
 parser = argparse.ArgumentParser(description="Training.")
 parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2text/', help='the dir to save logs and models')
@@ -103,9 +103,25 @@ accelerator = Accelerator(
         # gradient_accumulation_steps=config.gradient_accumulation_steps
     )
 
-pipe.transformer, optimizer, lr_scheduler = accelerator.prepare(pipe.transformer, optimizer, lr_scheduler)
-pipe.text_encoder, pipe.text_encoder_2 = accelerator.prepare(pipe.text_encoder, pipe.text_encoder_2)
-pipe.clip_image_encoder, pipe.text_decoder = accelerator.prepare(pipe.clip_image_encoder, pipe.text_decoder)
+(
+    optimizer, 
+    lr_scheduler,
+    pipe.transformer,
+    pipe.text_encoder, 
+    pipe.text_encoder_2,
+    pipe.clip_image_encoder,
+    pipe.text_decoder,
+    pipe.vae
+) = accelerator.prepare(
+    optimizer, 
+    lr_scheduler,
+    pipe.transformer,
+    pipe.text_encoder, 
+    pipe.text_encoder_2,
+    pipe.clip_image_encoder,
+    pipe.text_decoder,
+    pipe.vae
+)
 
 for epoch in range(num_epochs):
     progbar = tqdm(dataloader)

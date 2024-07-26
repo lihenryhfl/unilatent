@@ -1,5 +1,6 @@
 import argparse
 import torch
+import numpy as np
 from diffusers import StableDiffusion3Pipeline
 from unilatent import UniLatentPipeline, retrieve_timesteps
 
@@ -71,14 +72,16 @@ data_config = {
     'roots': [
         # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
         '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
-        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
+        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
         # '/mnt/bn/aigc-us/zjl/openimages/data/',
         # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
     ],
     'json_lst': [
         # '/mnt/bn/us-aigc-temp/henry/test.json',
         '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
-        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json'
+        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json',
+        # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json',
+        # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json'
     ],
     'load_vae_feat': False,
     'load_t5_feat': False
@@ -95,12 +98,13 @@ dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=
 num_epochs = 2
 
 # models = [pipe.text_decoder]
-models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
+# models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
+models = [pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
 
-optimizer = torch.optim.AdamW(lr=2e-5, params=pipe.parameters(models=models))
+optimizer = torch.optim.AdamW(lr=5e-5, params=pipe.parameters(models=models))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=100,
+            num_warmup_steps=1000,
             num_training_steps=(len(dataloader) * num_epochs),
         )
 
@@ -125,11 +129,20 @@ def truncate(texts):
     texts = pipe.tokenizer.batch_decode(pipe.tokenizer(
         texts,
         padding="max_length",
-        max_length=77 - 3,
+        max_length=77,
         truncation=True,
         return_tensors="pt",
     ).input_ids)
-    texts = [x.replace('<|endoftext|>', '').replace('<|startoftext|>', '') for x in texts]
+    texts = [x.replace('<|endoftext|>', '').replace('<|startoftext|>', '').strip().strip('!').strip() for x in texts]
+
+    texts = pipe.tokenizer_2.batch_decode(pipe.tokenizer_2(
+        texts,
+        padding="max_length",
+        max_length=77,
+        truncation=True,
+        return_tensors="pt",
+    ).input_ids)
+    texts = [x.replace('<|endoftext|>', '').replace('<|startoftext|>', '').strip().strip('!').strip() for x in texts]
 
     return texts
 
@@ -153,6 +166,9 @@ def truncate(texts):
     pipe.vae
 )
 
+d_losses = []
+c_losses = []
+
 for epoch in range(num_epochs):
     # progbar = tqdm(dataloader, mininterval=30, disable=not accelerator.is_main_process)
     progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
@@ -162,7 +178,8 @@ for epoch in range(num_epochs):
         # prepare data
         image, prompt = batch[0].to('cuda'), truncate(batch[1])
         batch[1] = [x.strip('<|endoftext|>') for x in batch[1]]
-        index = torch.randint(0, 1000, size=(len(image) * 2,))
+        # index = torch.randint(0, 1000, size=(len(image) * 2,))
+        index = torch.randint(250, 500, size=(len(image) * 2,))
 
         # run model
         prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt)
@@ -173,31 +190,36 @@ for epoch in range(num_epochs):
         image = torch.cat([image, image], axis=0)
         prompt = prompt + prompt
 
-        loss = 0.
-
         model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
-        loss += ((model_output - target) ** 2).mean()
+        d_loss = ((model_output - target) ** 2).mean()
 
-        loss += pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
-        # loss += pipe.embed_to_decoder(image_embeds, pooled_image_embeds, prompt)
+        c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+
+        loss = torch.nan_to_num(d_loss) + torch.nan_to_num(c_loss)
         accelerator.backward(loss)
 
-        grad_norm = accelerator.clip_grad_norm_(pipe.parameters(), 0.01)
+        d_losses.append(d_loss.item())
+        c_losses.append(c_loss.item())
 
+        num_params, num_nans = 0, 0
         for p in pipe.parameters():
             if p.grad is not None:
+                num_params += np.prod(p.shape)
+                num_nans += ((1 - p.grad.isfinite().int()).float()).sum()
                 torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
 
         optimizer.step()
         lr_scheduler.step()
         
-        progbar.set_description(f"loss: {loss.item():.3f}")
+        progbar.set_description(f"LOSSES: diff {np.mean(d_losses).item():02.3f} | ce {np.mean(c_losses).item():02.3f}")
 
         if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
             if (step + 1) % 2500 == 0 or step == 10:
                 pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
                 print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 
+            d_losses = []
+            c_losses = []
             embeds = torch.cat([prompt_embeds[:1], image_embeds[:1]])
             pooled_embeds = torch.cat([pooled_prompt_embeds[:1], pooled_image_embeds[:1]])
             embeds = torch.cat([embeds, pooled_embeds], axis=1)
@@ -205,8 +227,8 @@ for epoch in range(num_epochs):
                                 eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
             decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
             print(
-                f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace(' <|EOS|>', '')} \n"
-                f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace(' <|EOS|>', '')} \n"
+                f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+                f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
                 f"True: {batch[1][0]}"
             )
     

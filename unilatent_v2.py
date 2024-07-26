@@ -33,7 +33,6 @@ from utils import pad_mask
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin
 from diffusers.models.autoencoders import AutoencoderKL
-# from diffusers.models.transformers import SD3Transformer2DModel
 from transformer import SD3Transformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (
@@ -1035,15 +1034,15 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         result = self.clip_image_encoder(z)
         image_embed, pooled_image_embed = result.last_hidden_state, result.pooler_output
 
+        # increase channel dimension (B, 154, 1024) -> (B, 77, 2048)
+        B, N, C = image_embed.shape
+        image_embed = self.text_decoder.image_embedder(image_embed)
+        pooled_image_embed = self.text_decoder.pooled_image_embedder(pooled_image_embed)
+
         # slightly change the length
         B, N, C = image_embed.shape
         image_embed = self.text_decoder.relength(image_embed)
         pooled_image_embed = self.text_decoder.pooled_relength(pooled_image_embed.reshape(B, 1, C))
-
-        # increase channel dimension (B, 154, 1024) -> (B, 77, 2048)
-        B, N, C = image_embed.shape
-        image_embed = image_embed.reshape(B, N // 2, C * 2)
-        pooled_image_embed = pooled_image_embed.reshape(B, 1, C * 2)
 
         return image_embed, pooled_image_embed
 

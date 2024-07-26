@@ -312,8 +312,15 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         return_hidden = None
+        reported = False
 
         for index_block, block in enumerate(self.transformer_blocks):
+            if not reported:
+                if not hidden_states.isfinite().all():
+                    print(f"Got nan in hidden_states at layer {index_block}")
+                if not encoder_hidden_states.isfinite().all():
+                    print(f"Got nan in encoder_hidden_states at layer {index_block}")
+                reported = True
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
