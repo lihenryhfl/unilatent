@@ -28,12 +28,11 @@ from transformers import (
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from caption_decoder_v1 import TextDecoder
-from utils import pad_mask
+from utils import pad_mask, ReLength, Adapter
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin
 from diffusers.models.autoencoders import AutoencoderKL
-# from diffusers.models.transformers import SD3Transformer2DModel
 from transformer import SD3Transformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (
@@ -202,15 +201,19 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         tokenizer: CLIPTokenizer,
         text_encoder_2: CLIPTextModelWithProjection,
         tokenizer_2: CLIPTokenizer,
-        clip_image_encoder: CLIPVisionModel,# = None,
-        clip_image_processor: CLIPImageProcessor,# = None,
-        text_decoder: TextDecoder,# = None,
-        decoder_tokenizer: GPT2Tokenizer,# = None,
+        clip_image_encoder: CLIPVisionModel,
+        clip_image_processor: CLIPImageProcessor,
+        text_decoder: TextDecoder,
+        decoder_tokenizer: GPT2Tokenizer,
+        dift_relength: ReLength = None,
+        clip_image_adapter: Adapter = None,
+        dift_use_encoder_hidden: Optional[bool] = False,
     ):
         super().__init__()
         
         # for warning about truncation errors with CLIP
         self.num_warnings = 5
+        self.dift_use_encoder_hidden = dift_use_encoder_hidden
 
         if clip_image_encoder is not None:
             assert clip_image_processor is not None
@@ -227,6 +230,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             clip_image_processor=clip_image_processor,
             text_decoder=text_decoder,
             decoder_tokenizer=decoder_tokenizer,
+            dift_relength=dift_relength,
+            clip_image_adapter=clip_image_adapter
         )
         self.text_encoder_3 = None
         self.tokenizer_3 = None
@@ -1088,8 +1093,10 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         # format prompt_embeds correctly
         B, N, C = prompt_embeds.shape
-        prompt_embeds = self.text_decoder.image_embedder(prompt_embeds)
-        pooled_prompt_embeds = self.text_decoder.pooled_image_embedder(pooled_prompt_embeds)
+        if hasattr(self, 'clip_image_adapter'):
+            prompt_embeds = self.clip_image_adapter(pooled_prompt_embeds)
+            pooled_prompt_embeds = self.clip_image_adapter(pooled_prompt_embeds)
+
 
         prompt_embeds = self.format_clip_prompt_embeds(prompt_embeds)
         pooled_prompt_embeds = pooled_prompt_embeds.reshape(B, C)
@@ -1143,13 +1150,21 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     def dift_features(self, image, index, return_layer=4):
         prompt_embeds, pooled_prompt_embeds = self.encode_text("")
         
-        _, (_, hidden), _ = self.embed_to_denoiser(
+        _, (encoder_hidden, hidden), _ = self.embed_to_denoiser(
             image,
             prompt_embeds,
             pooled_prompt_embeds,
             index,
-            return_layer=return_layer)
+            return_layer=return_layer,
+            )
 
-        hidden = hidden[:, :512]
+        if self.dift_use_encoder_hidden:
+            hidden = encoder_hidden
+
+        if hasattr(self, 'dift_relength'):
+            self.dift_relength.to(self.device)
+            hidden = self.dift_relength(hidden.to(self.device))
+        else:
+            hidden = hidden[:, :512]
         # basic conversion to work with our framework
         return hidden[:, :-1], hidden[:, -1:]

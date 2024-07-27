@@ -315,6 +315,7 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         reported = False
 
         for index_block, block in enumerate(self.transformer_blocks):
+            assert encoder_hidden_states is not None and hidden_states is not None, index_block
             if not reported:
                 if not hidden_states.isfinite().all():
                     print(f"Got nan in hidden_states at layer {index_block}")
@@ -347,6 +348,7 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                 )
 
             if return_layer is not None and index_block == return_layer:
+                assert encoder_hidden_states is not None and hidden_states is not None
                 return_hidden = encoder_hidden_states, hidden_states
 
             # controlnet residual

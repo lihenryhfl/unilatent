@@ -83,7 +83,7 @@ def clip_sampler(batch, pipe):
 
 def generate_captions(pipe, dataloader, save_path, sampler, sampler_kwargs={}):
     json_list = []
-    progbar = tqdm(iter(dataloader))
+    progbar = tqdm(dataloader)
     for i, batch in enumerate(progbar):
         with torch.no_grad():
             decoded_text = sampler(batch, pipe, **sampler_kwargs)
@@ -100,12 +100,13 @@ def generate_captions(pipe, dataloader, save_path, sampler, sampler_kwargs={}):
     return json_list
 
 # %%
+epoch = 49999
 # for block_num in [6, 12]:
 for block_num in [12]:
     for index in [0, 250, 500, 750]:
         name = f'index_{index:03d}_block_{block_num}'
-        save_path = f'/mnt/bn/us-aigc-temp/henry/data/captions/dift/dift_{name}_step_34999.json'
-        load_path = f'/mnt/bn/us-aigc-temp/henry/data/dift/{name}/epoch_0_step_34999/'
+        save_path = f'/mnt/bn/us-aigc-temp/henry/data/captions/dift/dift_{name}_step_{epoch}.json'
+        load_path = f'/mnt/bn/us-aigc-temp/henry/data/dift/{name}/epoch_0_step_{epoch}/'
         print(f"Loading pipeline for {name}:")
         pipe = UniLatentPipeline.from_pretrained(load_path, torch_dtype=torch.float32)
 

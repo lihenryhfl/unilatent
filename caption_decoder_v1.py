@@ -92,7 +92,7 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         self.prefix_inner_dim = prefix_inner_dim # in the future change this to input dim to be more clear
         self.prefix_hidden_dim = prefix_hidden_dim if prefix_hidden_dim is not None else prefix_inner_dim
 
-        # prefix_len = embed_len + pooled_embed_len
+        # note: prefix_len = embed_len + pooled_embed_len
         self.relength = ReLength((prefix_length - 1) * 2, prefix_inner_dim // 2, 16) # for embed
         self.pooled_relength = ReLength(2, prefix_inner_dim // 2, 16) # for pooled_embed
 
@@ -194,6 +194,7 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
             # prefix_embeds = self.decode_prefix(feature.to(device))  # back to the clip feature
             hidden = self.encode_prefix(feature.to(device))
             prefix_embeds = self.decode_prefix(hidden)
+            # print("WHOA INSIDE CAPTION DECODER", prefix_embeds.norm(), prefix_embeds.mean(), prefix_embeds.std())
             # Only support beam search for now
             output_tokens, seq_lengths = self.generate_beam(
                 input_embeds=prefix_embeds, device=device, eos_token_id=eos_token_id
