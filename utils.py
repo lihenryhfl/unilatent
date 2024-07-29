@@ -3,6 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import xformers.ops
 
+from transformers.modeling_utils import ModuleUtilsMixin
+from transformers.configuration_utils import PretrainedConfig
+
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models import ModelMixin
+
 def pad_mask(orig_mask, prefix_len=77):
     extra_zeros = torch.ones(size=(orig_mask.shape[0], prefix_len), dtype=orig_mask.dtype, device=orig_mask.device)
     return torch.cat([extra_zeros, orig_mask], axis=1)
@@ -81,6 +87,55 @@ class Adapter(nn.Module):
 
         return x
         
+class EmbedAdapter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
+    @register_to_config
+    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.output_length = output_length
+        self.redimension = ReDimension(input_dim, output_dim)
+        self.pooled_redimension = ReDimension(input_dim, output_dim)
+
+        if output_length > -1:
+            self.relength = ReLength(output_length, output_dim, n_heads)
+
+    def forward(self, x, x_pooled):
+        x = self.redimension(x)
+        x_pooled = self.redimension(x_pooled)
+
+        if hasattr(self, 'relength'):
+            x = self.relength(x)
+
+        return x, x_pooled
+        
+
+class AdapterConfig(PretrainedConfig):
+
+    # model_type = "adapter"
+    # keys_to_ignore_at_inference = ["past_key_values"]
+    # attribute_map = {
+    #     "hidden_size": "n_embd",
+    #     "max_position_embeddings": "n_positions",
+    #     "num_attention_heads": "n_head",
+    #     "num_hidden_layers": "n_layer",
+    # }
+
+    def __init__(
+        self,
+        input_dim, 
+        output_dim, 
+        output_length=-1, 
+        n_heads=16
+    ):
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.output_length = output_length
+        self.n_heads = n_heads
+
+        super().__init__()
+
+# class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
 
 def generate_captions(pipe, dataloader, save_path, sampler, sampler_kwargs={}):
     json_list = []

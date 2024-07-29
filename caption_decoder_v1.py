@@ -92,17 +92,17 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         self.prefix_inner_dim = prefix_inner_dim # in the future change this to input dim to be more clear
         self.prefix_hidden_dim = prefix_hidden_dim if prefix_hidden_dim is not None else prefix_inner_dim
 
-        # note: prefix_len = embed_len + pooled_embed_len
-        self.relength = ReLength((prefix_length - 1) * 2, prefix_inner_dim // 2, 16) # for embed
-        self.pooled_relength = ReLength(2, prefix_inner_dim // 2, 16) # for pooled_embed
+        # # note: prefix_len = embed_len + pooled_embed_len
+        # self.relength = ReLength((prefix_length - 1) * 2, prefix_inner_dim // 2, 16) # for embed
+        # self.pooled_relength = ReLength(2, prefix_inner_dim // 2, 16) # for pooled_embed
 
-        self.image_embedder = nn.Linear(prefix_inner_dim, prefix_inner_dim)
-        self.pooled_image_embedder = nn.Linear(prefix_inner_dim, prefix_inner_dim)
+        # # self.image_embedder = nn.Linear(prefix_inner_dim, prefix_inner_dim)
+        # # self.pooled_image_embedder = nn.Linear(prefix_inner_dim, prefix_inner_dim)
 
-        nn.init.constant_(self.image_embedder.weight, 0)
-        nn.init.constant_(self.image_embedder.bias, 0)
-        nn.init.constant_(self.pooled_image_embedder.weight, 0)
-        nn.init.constant_(self.pooled_image_embedder.bias, 0)
+        # # nn.init.constant_(self.image_embedder.weight, 0)
+        # # nn.init.constant_(self.image_embedder.bias, 0)
+        # # nn.init.constant_(self.pooled_image_embedder.weight, 0)
+        # # nn.init.constant_(self.pooled_image_embedder.bias, 0)
 
         if self.prefix_inner_dim != self.prefix_hidden_dim:
             self.encode_prefix = (

@@ -3,7 +3,7 @@ import json
 import argparse
 import torch
 from diffusers import StableDiffusion3Pipeline
-from unilatent import UniLatentPipeline, retrieve_timesteps
+from unilatent import UniLatentPipeline
 
 from data.builder import build_dataset, build_dataloader
 from aspect_ratio_sampler import AspectRatioBatchSampler
@@ -22,7 +22,7 @@ from transformers import (
 
 # from caption_decoder import TextDecoder
 from caption_decoder_v1 import TextDecoder
-from utils import ReLength
+from utils import ReLength, EmbedAdapter
 
 from transformer import SD3Transformer2DModel
 
@@ -35,6 +35,8 @@ parser.add_argument('--index', type=int, default=500)
 parser.add_argument('--sample_and_exit', action='store_true')
 parser.add_argument('--v2', action='store_true')
 parser.add_argument('--hidden', action='store_true')
+parser.add_argument('--global_step', type=int, default=0)
+parser.add_argument('--prefix_length', type=int, default=0)
 args = parser.parse_args()
 
 if not args.load_from:
@@ -45,7 +47,7 @@ if not args.load_from:
     pipe.decoder_tokenizer = decoder_tokenizer
 
     text_decoder = TextDecoder(
-        prefix_length=512,
+        prefix_length=args.prefix_length,
         prefix_inner_dim=1536,
         prefix_hidden_dim=1536,
         vocab_size=decoder_tokenizer.vocab_size + 1)
@@ -59,9 +61,9 @@ if not args.load_from:
     pipe.transformer = transformer
 
     if args.v2:
-        relength = ReLength(512, 1536, 16) # V2
+        image_encoder_adapter = EmbedAdapter(1536, 1536, args.prefix_length - 1) # V2
     else:
-        relength = None
+        image_encoder_adapter = None
 
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
@@ -75,7 +77,7 @@ if not args.load_from:
         clip_image_processor=pipe.clip_image_processor,
         text_decoder=pipe.text_decoder,
         decoder_tokenizer=pipe.decoder_tokenizer,
-        dift_relength=relength,
+        image_encoder_adapter=image_encoder_adapter,
         dift_use_encoder_hidden=args.hidden
     )
 else:
@@ -132,7 +134,7 @@ else:
 
 num_epochs = 2
 
-models = [pipe.text_decoder]
+models = [pipe.text_decoder, pipe.image_encoder_adapter]
 # models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
 
 optimizer = torch.optim.AdamW(lr=1e-4, params=pipe.parameters(models=models))
@@ -170,7 +172,7 @@ def truncate(texts):
     pipe.transformer,
     pipe.text_encoder, 
     pipe.text_encoder_2,
-    pipe.clip_image_encoder,
+    pipe.image_encoder_adapter,
     pipe.text_decoder,
     pipe.vae
 ) = accelerator.prepare(
@@ -179,12 +181,14 @@ def truncate(texts):
     pipe.transformer,
     pipe.text_encoder, 
     pipe.text_encoder_2,
-    pipe.clip_image_encoder,
+    pipe.image_encoder_adapter,
     pipe.text_decoder,
     pipe.vae
 )
 
 print(f"TOTAL TRANSFORMER LAYERS: {len(pipe.transformer.transformer_blocks)} | OUR CHOSEN BLOCK: {args.block_num}")
+
+global_step = args.global_step
 
 def sample(batch):
     with torch.no_grad():
@@ -197,7 +201,7 @@ def sample(batch):
     return decoded_text
 
 if args.sample_and_exit:
-    save_path = os.path.join(args.work_dir, 'captions.json')
+    save_path = os.path.join(args.work_dir, 'captions_50k.json')
     print("Saving to", save_path)
     json_list = []
     progbar = tqdm(val_loader)
@@ -240,8 +244,8 @@ else:
             
             progbar.set_description(f"loss: {loss.item():.3f}")
 
-            if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
-                if (step + 1) % 5000 == 0 or step == 10:
+            if accelerator.is_main_process and ((global_step + 1) % 500 == 0 or global_step == 10):
+                if (global_step + 1) % 5000 == 0 or step == 10:
                     pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
                     print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 
@@ -251,4 +255,5 @@ else:
                     f"Recon: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace(' <|EOS|>', '')} | "
                     f"True: {batch[1][0]}"
                 )
+            global_step += 1
     

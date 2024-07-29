@@ -1,8 +1,9 @@
+import os
 import argparse
 import torch
 import numpy as np
 from diffusers import StableDiffusion3Pipeline
-from unilatent import UniLatentPipeline, retrieve_timesteps
+from unilatent import UniLatentPipeline
 
 from data.builder import build_dataset, build_dataloader
 from aspect_ratio_sampler import AspectRatioBatchSampler
@@ -21,7 +22,7 @@ from transformers import (
 
 from caption_decoder_v1 import TextDecoder
 from transformer import SD3Transformer2DModel
-from utils import Adapter
+from utils import EmbedAdapter
 
 parser = argparse.ArgumentParser(description="Training.")
 parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2text/', help='the dir to save logs and models')
@@ -63,7 +64,7 @@ if not args.load_from:
 else:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 
-pipe.register_modules(clip_image_adapter=Adapter(2048, 2048, 78, 78))
+pipe.register_modules(image_encoder_adapter=EmbedAdapter(1024, 2048, 77))
 
 val_data_config = {
     'type': 'FlexibleInternalDataMS',
@@ -117,11 +118,12 @@ num_epochs = 2
 
 # models = [pipe.text_decoder]
 # models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
-models = [pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
-models2 = [pipe.clip_image_adapter]
+# models = [pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2, pipe.image_encoder_adapter]
+models = [pipe.text_decoder, pipe.image_encoder_adapter]
+# models2 = [pipe.image_encoder_adapter]
 
 optimizer = torch.optim.AdamW(lr=5e-5, params=pipe.parameters(models=models))
-optimizer.add_param_group(dict(params=pipe.parameters(models=models2), lr=5e-5, weight_decay=1e-1))
+# optimizer.add_param_group(dict(params=pipe.parameters(models=models2), lr=5e-5, weight_decay=1e-1))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=1000,
@@ -131,14 +133,8 @@ lr_scheduler = get_cosine_schedule_with_warmup(
 for p in pipe.parameters():
     p.requires_grad = False
 
-for p in pipe.parameters(models=models + models2):
+for p in pipe.parameters(models=models):# + models2):
     p.requires_grad = True
-
-# for p in pipe.text_decoder.relength.parameters():
-#     p.requires_grad = False
-
-# for p in pipe.text_decoder.pooled_relength.parameters():
-#     p.requires_grad = False
 
 accelerator = Accelerator(
         mixed_precision='fp16',
@@ -176,7 +172,7 @@ def prepare(pipe):
         pipe.clip_image_encoder,
         pipe.text_decoder,
         pipe.vae,
-        pipe.clip_image_adapter
+        pipe.image_encoder_adapter
     ) = accelerator.prepare(
         pipe.transformer,
         pipe.text_encoder, 
@@ -184,7 +180,7 @@ def prepare(pipe):
         pipe.clip_image_encoder,
         pipe.text_decoder,
         pipe.vae,
-        pipe.clip_image_adapter
+        pipe.image_encoder_adapter
     )
     return pipe
 
@@ -195,7 +191,7 @@ def unwrap(pipe):
     pipe.clip_image_encoder = accelerator.unwrap_model(pipe.clip_image_encoder)
     pipe.text_decoder = accelerator.unwrap_model(pipe.text_decoder)
     pipe.vae = accelerator.unwrap_model(pipe.vae)
-    pipe.clip_image_adapter = accelerator.unwrap_model(pipe.clip_image_adapter)
+    pipe.image_encoder_adapter = accelerator.unwrap_model(pipe.image_encoder_adapter)
     return pipe
 
 def save(pipe, path):
@@ -205,18 +201,19 @@ def save(pipe, path):
     accelerator.unwrap_model(pipe.clip_image_encoder).save_pretrained(os.path.join(path, 'clip_image_encoder'))
     accelerator.unwrap_model(pipe.text_decoder).save_pretrained(os.path.join(path, 'text_decoder'))
     accelerator.unwrap_model(pipe.vae).save_pretrained(os.path.join(path, 'vae'))
-    accelerator.unwrap_model(pipe.clip_image_adapter).save_pretrained(os.path.join(path, 'clip_image_adapter'))
+    accelerator.unwrap_model(pipe.image_encoder_adapter).save_pretrained(os.path.join(path, 'image_encoder_adapter'))
 
 pipe = prepare(pipe)
 
 def sample(batch):
     image, prompt = batch[0].to('cuda'), truncate(batch[1])
     with torch.no_grad():
-        prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt[:1])
+        # prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt[:1])
         image_embeds, pooled_image_embeds = pipe.encode_image(image[:1], dtype=torch.float16)
-        embeds = torch.cat([prompt_embeds, image_embeds])
-        pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds])
-        embeds = torch.cat([embeds, pooled_embeds], axis=1)
+        embeds = torch.cat([image_embeds, pooled_image_embeds], axis=1)
+        # embeds = torch.cat([prompt_embeds, image_embeds])
+        # pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds])
+        # embeds = torch.cat([embeds, pooled_embeds], axis=1)
         decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
                             eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
         decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
@@ -241,15 +238,20 @@ for epoch in range(num_epochs):
         prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt)
         image_embeds, pooled_image_embeds = pipe.encode_image(image, dtype=torch.float16)
 
-        embeds = torch.cat([prompt_embeds, image_embeds], axis=0)
-        pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds], axis=0)
-        image = torch.cat([image, image], axis=0)
-        prompt = prompt + prompt
+        # embeds = torch.cat([prompt_embeds, image_embeds], axis=0)
+        # pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds], axis=0)
+        # image = torch.cat([image, image], axis=0)
+        # prompt = prompt + prompt
+        embeds, pooled_embeds = image_embeds, pooled_image_embeds
 
-        model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
-        d_loss = torch.nan_to_num(((model_output - target) ** 2).mean())
+        # model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
+        # d_loss = torch.nan_to_num(((model_output - target) ** 2).mean())
+        d_loss = torch.tensor(0., dtype=torch.float16, device=accelerator.device)
 
-        c_loss = torch.nan_to_num(pipe.embed_to_decoder(embeds, pooled_embeds, prompt))
+        c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+        if not c_loss.isfinite().all():
+            print(f"c_loss has nan.")
+        c_loss = torch.nan_to_num(c_loss)
 
         loss = d_loss + c_loss
         accelerator.backward(loss)
@@ -270,12 +272,14 @@ for epoch in range(num_epochs):
         progbar.set_description(f"LOSSES: diff {np.mean(d_losses).item():02.3f} | ce {np.mean(c_losses).item():02.3f}")
 
         if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
-            if (step + 1) % 5000 == 0 or step == 10:
-                # save(pipe, f'{args.work_dir}/epoch_{epoch}_step_{step}/')
+            if (step + 1) % 500 == 0 or step == 10:
+                pipe = unwrap(pipe)
+                pipe.save_pretrained(f'{args.work_dir}/current/', safe_serialization=False)
+                # save(pipe, os.path.join(f'{args.work_dir}', 'current'))
+                print(f"Saved model to directory {f'{args.work_dir}/current/'}")
+            elif (step + 1) % 5000 == 0 or step == 10:
                 pipe = unwrap(pipe)
                 pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
-                # pipe.from_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/', torch_dtype=torch.float32)
-                # pipe = prepare(pipe)
                 print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 
             d_losses = []
@@ -283,9 +287,13 @@ for epoch in range(num_epochs):
 
             batch = next(iter(val_loader))
             decoded_text = sample(batch)
+            # print(
+            #     f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+            #     f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+            #     f"True: {batch[1][0]}"
+            # )
             print(
-                f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
-                f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+                f"Recon from image: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
                 f"True: {batch[1][0]}"
             )
     

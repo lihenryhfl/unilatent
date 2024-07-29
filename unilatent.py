@@ -28,7 +28,7 @@ from transformers import (
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from caption_decoder_v1 import TextDecoder
-from utils import pad_mask, ReLength, Adapter
+from utils import pad_mask, ReLength, Adapter, EmbedAdapter
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin
@@ -179,7 +179,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->text_decoder->clip_image_encoder->transformer->vae"
-    _optional_components = []
+    _optional_components = ['image_decoder_adapter', 'image_encoder_adapter']
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
 
     def __getattribute__(self, name):
@@ -205,8 +205,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         clip_image_processor: CLIPImageProcessor,
         text_decoder: TextDecoder,
         decoder_tokenizer: GPT2Tokenizer,
-        dift_relength: ReLength = None,
-        clip_image_adapter: Adapter = None,
+        image_decoder_adapter: EmbedAdapter = None,
+        image_encoder_adapter: EmbedAdapter = None,
         dift_use_encoder_hidden: Optional[bool] = False,
     ):
         super().__init__()
@@ -230,8 +230,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             clip_image_processor=clip_image_processor,
             text_decoder=text_decoder,
             decoder_tokenizer=decoder_tokenizer,
-            dift_relength=dift_relength,
-            clip_image_adapter=clip_image_adapter
+            image_decoder_adapter=image_decoder_adapter,
+            image_encoder_adapter=image_encoder_adapter
         )
         self.text_encoder_3 = None
         self.tokenizer_3 = None
@@ -1040,15 +1040,21 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         result = self.clip_image_encoder(z)
         image_embed, pooled_image_embed = result.last_hidden_state, result.pooler_output
 
-        # slightly change the length
         B, N, C = image_embed.shape
-        image_embed = self.text_decoder.relength(image_embed)
-        pooled_image_embed = self.text_decoder.pooled_relength(pooled_image_embed.reshape(B, 1, C))
+        pooled_image_embed = pooled_image_embed.reshape(B, 1, C)
 
-        # increase channel dimension (B, 154, 1024) -> (B, 77, 2048)
-        B, N, C = image_embed.shape
-        image_embed = image_embed.reshape(B, N // 2, C * 2)
-        pooled_image_embed = pooled_image_embed.reshape(B, 1, C * 2)
+        if self._hasattr('image_encoder_adapter'):
+            image_embed, pooled_image_embed = self.image_encoder_adapter(image_embed, pooled_image_embed)
+
+        # # slightly change the length
+        # B, N, C = image_embed.shape
+        # image_embed = self.text_decoder.relength(image_embed)
+        # pooled_image_embed = self.text_decoder.pooled_relength(pooled_image_embed.reshape(B, 1, C))
+
+        # # increase channel dimension (B, 154, 1024) -> (B, 77, 2048)
+        # B, N, C = image_embed.shape
+        # image_embed = image_embed.reshape(B, N // 2, C * 2)
+        # pooled_image_embed = pooled_image_embed.reshape(B, 1, C * 2)
 
         return image_embed, pooled_image_embed
 
@@ -1093,9 +1099,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         # format prompt_embeds correctly
         B, N, C = prompt_embeds.shape
-        if hasattr(self, 'clip_image_adapter'):
-            prompt_embeds = self.clip_image_adapter(pooled_prompt_embeds)
-            pooled_prompt_embeds = self.clip_image_adapter(pooled_prompt_embeds)
+        if self._hasattr('image_decoder_adapter'):
+            prompt_embeds, pooled_prompt_embeds = self.image_decoder_adapter(prompt_embeds, pooled_prompt_embeds)
 
 
         prompt_embeds = self.format_clip_prompt_embeds(prompt_embeds)
@@ -1161,10 +1166,20 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         if self.dift_use_encoder_hidden:
             hidden = encoder_hidden
 
-        if hasattr(self, 'dift_relength'):
-            self.dift_relength.to(self.device)
-            hidden = self.dift_relength(hidden.to(self.device))
+        if self._hasattr('image_encoder_adapter'):
+            self.image_encoder_adapter.to(self.device)
+            hidden, hidden_pooled = self.image_encoder_adapter(hidden[:, :-1], hidden[:, -1:])
         else:
-            hidden = hidden[:, :512]
+            hidden, hidden_pooled = hidden[:, :511], hidden[:, 511:512]
         # basic conversion to work with our framework
-        return hidden[:, :-1], hidden[:, -1:]
+        return hidden, hidden_pooled
+
+    def _hasattr(self, name):
+        if not hasattr(self, name):
+            return False
+        elif getattr(self, name) is None:
+            return False
+        elif isinstance(getattr(self, name), list) and getattr(self, name)[0] is None:
+            return False
+
+        return True
