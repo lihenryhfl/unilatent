@@ -135,7 +135,31 @@ class AdapterConfig(PretrainedConfig):
 
         super().__init__()
 
-# class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
+
+class SoftPrompter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
+    @register_to_config
+    def __init__(self, d_model, length=1, n_heads=16):
+        super().__init__()
+        self.register_buffer('soft_prompt', torch.randn(size=(1, length, d_model)) * 0.5)
+        self.register_buffer('pooled_soft_prompt', torch.randn(size=(1, length, d_model)) * 0.5)
+
+    def forward(self, x, x_pooled):
+        return x + self.soft_prompt, x_pooled + self.pooled_soft_prompt
+        
+
+class SoftPrompterConfig(PretrainedConfig):
+
+    def __init__(
+        self,
+        d_model, 
+        length=1,
+        n_heads=16
+    ):
+        self.d_model = d_model
+        self.length = length
+        self.n_heads = n_heads
+
+        super().__init__()
 
 def generate_captions(pipe, dataloader, save_path, sampler, sampler_kwargs={}):
     json_list = []

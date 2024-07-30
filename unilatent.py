@@ -28,7 +28,7 @@ from transformers import (
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from caption_decoder_v1 import TextDecoder
-from utils import pad_mask, ReLength, Adapter, EmbedAdapter
+from utils import pad_mask, EmbedAdapter, SoftPrompter
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin
@@ -179,7 +179,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->text_decoder->clip_image_encoder->transformer->vae"
-    _optional_components = ['image_decoder_adapter', 'image_encoder_adapter']
+    _optional_components = ['image_decoder_adapter', 'image_encoder_adapter', 'soft_prompter']
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
 
     def __getattribute__(self, name):
@@ -207,13 +207,12 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         decoder_tokenizer: GPT2Tokenizer,
         image_decoder_adapter: EmbedAdapter = None,
         image_encoder_adapter: EmbedAdapter = None,
-        dift_use_encoder_hidden: Optional[bool] = False,
+        soft_prompter: SoftPrompter = None,
     ):
         super().__init__()
         
         # for warning about truncation errors with CLIP
         self.num_warnings = 5
-        self.dift_use_encoder_hidden = dift_use_encoder_hidden
 
         if clip_image_encoder is not None:
             assert clip_image_processor is not None
@@ -231,7 +230,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             text_decoder=text_decoder,
             decoder_tokenizer=decoder_tokenizer,
             image_decoder_adapter=image_decoder_adapter,
-            image_encoder_adapter=image_encoder_adapter
+            image_encoder_adapter=image_encoder_adapter,
+            soft_prompter=soft_prompter,
         )
         self.text_encoder_3 = None
         self.tokenizer_3 = None
@@ -1046,16 +1046,6 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         if self._hasattr('image_encoder_adapter'):
             image_embed, pooled_image_embed = self.image_encoder_adapter(image_embed, pooled_image_embed)
 
-        # # slightly change the length
-        # B, N, C = image_embed.shape
-        # image_embed = self.text_decoder.relength(image_embed)
-        # pooled_image_embed = self.text_decoder.pooled_relength(pooled_image_embed.reshape(B, 1, C))
-
-        # # increase channel dimension (B, 154, 1024) -> (B, 77, 2048)
-        # B, N, C = image_embed.shape
-        # image_embed = image_embed.reshape(B, N // 2, C * 2)
-        # pooled_image_embed = pooled_image_embed.reshape(B, 1, C * 2)
-
         return image_embed, pooled_image_embed
 
     def encode_text(self, x):
@@ -1091,7 +1081,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         
         return self.embed_to_decoder(image_embed, pooled_image_embed, prompt)
 
-    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, return_layer=None):
+    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, return_layer=None, apply_soft_prompt=False):
         latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
         latent = (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
@@ -1102,6 +1092,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         if self._hasattr('image_decoder_adapter'):
             prompt_embeds, pooled_prompt_embeds = self.image_decoder_adapter(prompt_embeds, pooled_prompt_embeds)
 
+        if apply_soft_prompt:
+            prompt_embeds, pooled_prompt_embeds = self.soft_prompter(prompt_embeds, pooled_prompt_embeds)
 
         prompt_embeds = self.format_clip_prompt_embeds(prompt_embeds)
         pooled_prompt_embeds = pooled_prompt_embeds.reshape(B, C)
@@ -1161,10 +1153,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             pooled_prompt_embeds,
             index,
             return_layer=return_layer,
+            apply_soft_prompt=True
             )
-
-        if self.dift_use_encoder_hidden:
-            hidden = encoder_hidden
 
         if self._hasattr('image_encoder_adapter'):
             self.image_encoder_adapter.to(self.device)
