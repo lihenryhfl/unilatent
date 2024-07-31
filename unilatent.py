@@ -28,7 +28,7 @@ from transformers import (
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from caption_decoder_v1 import TextDecoder
-from utils import pad_mask
+from utils import pad_mask, EmbedAdapter
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin
@@ -180,7 +180,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->text_decoder->clip_image_encoder->transformer->vae"
-    _optional_components = []
+    _optional_components = ['image_encoder_adapter']
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
 
     def __getattribute__(self, name):
@@ -206,6 +206,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         clip_image_processor: CLIPImageProcessor,# = None,
         text_decoder: TextDecoder,# = None,
         decoder_tokenizer: GPT2Tokenizer,# = None,
+        image_encoder_adapter: EmbedAdapter = None,
     ):
         super().__init__()
         
@@ -227,6 +228,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             clip_image_processor=clip_image_processor,
             text_decoder=text_decoder,
             decoder_tokenizer=decoder_tokenizer,
+            image_encoder_adapter=image_encoder_adapter
         )
         self.text_encoder_3 = None
         self.tokenizer_3 = None
@@ -1061,7 +1063,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         return prompt_embeds, pooled_prompt_embeds.reshape(B, 1, C)
 
     def embed_to_decoder(self, embed, pooled_embed, prompt):
-        assert (embed.shape[1] + 1) == self.text_decoder.prefix_length, embed.shape
+        assert (embed.shape[1] + 1) == self.text_decoder.prefix_length, f"{embed.shape}, {self.text_decoder.prefix_length}"
         B, N, C = embed.shape
         joint_embed = torch.cat([embed, pooled_embed.reshape(B, 1, C)], axis=1)
 
@@ -1147,6 +1149,10 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             index,
             return_layer=return_layer)
 
+        # pooled_hidden = hidden.max(axis=1, keepdims=True)[0]
+        # hidden, pooled_hidden = self.image_encoder_adapter(hidden, pooled_hidden)
+        # return hidden, pooled_hidden
         hidden = hidden[:, :512]
         # basic conversion to work with our framework
         return hidden[:, :-1], hidden[:, -1:]
+        

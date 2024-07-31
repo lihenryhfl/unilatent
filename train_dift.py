@@ -20,59 +20,59 @@ from transformers import (
 
 # from caption_decoder import TextDecoder
 from caption_decoder_v1 import TextDecoder
-from utils import ReLength
+from utils import ReLength, EmbedAdapter
 
 from transformer import SD3Transformer2DModel
 
 parser = argparse.ArgumentParser(description="Training.")
 parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2text/', help='the dir to save logs and models')
+parser.add_argument('--load_from', default='', help='the dir to load logs and models')
 parser.add_argument('--batch_size', type=int, default=48)
 parser.add_argument('--block_num', type=int, default=4)
 parser.add_argument('--index', type=int, default=500)
 args = parser.parse_args()
 
-pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float32)
+if args.load_from:
+    pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
+else:
+    pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float32)
 
-decoder_tokenizer = GPT2Tokenizer.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt_tokenizer/')
-decoder_tokenizer.add_special_tokens({'pad_token': decoder_tokenizer.eos_token})
-pipe.decoder_tokenizer = decoder_tokenizer
+    decoder_tokenizer = GPT2Tokenizer.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt_tokenizer/')
+    decoder_tokenizer.add_special_tokens({'pad_token': decoder_tokenizer.eos_token})
+    pipe.decoder_tokenizer = decoder_tokenizer
 
-# text_decoder = TextDecoder.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt/', 
-#                     device_map=None, low_cpu_mem_usage=False, torch_dtype=torch.float32, ignore_mismatched_sizes=True)
-# # slightly hacky -- cannot save wte weights since they are shared with lm_head, so we copy them back here
-# text_decoder.transformer.transformer.wte.weight = text_decoder.transformer.lm_head.weight
-# text_decoder.decode_prefix = torch.nn.Linear(1024, 768)
-text_decoder = TextDecoder(
-    prefix_length=512,
-    prefix_inner_dim=1536,
-    prefix_hidden_dim=1536,
-    vocab_size=decoder_tokenizer.vocab_size + 1)
-pipe.text_decoder = text_decoder
+    text_decoder = TextDecoder(
+        prefix_length=512,
+        prefix_inner_dim=1536,
+        prefix_hidden_dim=1536,
+        vocab_size=decoder_tokenizer.vocab_size + 1)
+    pipe.text_decoder = text_decoder
 
-pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
-pipe.clip_image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
+    pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
+    pipe.clip_image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
 
-# pipe.transformer = SD3Transformer2DModel.from_config(pipe.transformer.config).load_state_dict(pipe.transformer.state_dict())
-transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
-transformer.load_state_dict(pipe.transformer.state_dict())
-pipe.transformer = transformer
+    # pipe.transformer = SD3Transformer2DModel.from_config(pipe.transformer.config).load_state_dict(pipe.transformer.state_dict())
+    transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
+    transformer.load_state_dict(pipe.transformer.state_dict())
+    pipe.transformer = transformer
 
-pipe = UniLatentPipeline(
-    transformer=pipe.transformer,
-    scheduler=pipe.scheduler,
-    vae=pipe.vae,
-    text_encoder=pipe.text_encoder,
-    tokenizer=pipe.tokenizer,
-    text_encoder_2=pipe.text_encoder_2,
-    tokenizer_2=pipe.tokenizer_2,
-    clip_image_encoder=pipe.clip_image_encoder,
-    clip_image_processor=pipe.clip_image_processor,
-    text_decoder=pipe.text_decoder,
-    decoder_tokenizer=pipe.decoder_tokenizer,
-)
+    image_encoder_adapter = EmbedAdapter(input_dim=1536, output_dim=1536, output_length=511, n_heads=16)
+    # image_encoder_adapter = None
 
-# pipe = UniLatentPipeline.from_pretrained('/mnt/bn/us-aigc-temp/henry/data/clip_test/', 
-#                     device_map=None, low_cpu_mem_usage=False, torch_dtype=torch.float32)
+    pipe = UniLatentPipeline(
+        transformer=pipe.transformer,
+        scheduler=pipe.scheduler,
+        vae=pipe.vae,
+        text_encoder=pipe.text_encoder,
+        tokenizer=pipe.tokenizer,
+        text_encoder_2=pipe.text_encoder_2,
+        tokenizer_2=pipe.tokenizer_2,
+        clip_image_encoder=pipe.clip_image_encoder,
+        clip_image_processor=pipe.clip_image_processor,
+        text_decoder=pipe.text_decoder,
+        decoder_tokenizer=pipe.decoder_tokenizer,
+        image_encoder_adapter=image_encoder_adapter
+    )
 
 data_config = {
     'type': 'FlexibleInternalDataMS',
@@ -118,12 +118,6 @@ for p in pipe.parameters():
 for p in pipe.parameters(models=models):
     p.requires_grad = True
 
-# for p in pipe.text_decoder.relength.parameters():
-#     p.requires_grad = False
-
-# for p in pipe.text_decoder.pooled_relength.parameters():
-#     p.requires_grad = False
-
 accelerator = Accelerator(
         mixed_precision='fp16',
         # gradient_accumulation_steps=config.gradient_accumulation_steps
@@ -141,6 +135,7 @@ def truncate(texts):
 
     return texts
 
+pipe = pipe.to(accelerator.device)
 (
     optimizer, 
     lr_scheduler,
@@ -149,7 +144,8 @@ def truncate(texts):
     pipe.text_encoder_2,
     pipe.clip_image_encoder,
     pipe.text_decoder,
-    pipe.vae
+    pipe.vae,
+    pipe.image_encoder_adapter
 ) = accelerator.prepare(
     optimizer, 
     lr_scheduler,
@@ -158,7 +154,8 @@ def truncate(texts):
     pipe.text_encoder_2,
     pipe.clip_image_encoder,
     pipe.text_decoder,
-    pipe.vae
+    pipe.vae,
+    pipe.image_encoder_adapter
 )
 
 print(f"TOTAL TRANSFORMER LAYERS: {len(pipe.transformer.transformer_blocks)} | OUR CHOSEN BLOCK: {args.block_num}")
@@ -192,7 +189,7 @@ for epoch in range(num_epochs):
         
         progbar.set_description(f"loss: {loss.item():.3f}")
 
-        if accelerator.is_main_process and ((step + 1) % 2500 == 0 or step == 10):
+        if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
             if (step + 1) % 10000 == 0 or step == 10:
                 pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
                 print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
