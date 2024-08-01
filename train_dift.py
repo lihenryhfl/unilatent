@@ -33,6 +33,7 @@ parser.add_argument('--batch_size', type=int, default=32)
 parser.add_argument('--block_num', type=int, default=4)
 parser.add_argument('--index', type=int, default=500)
 parser.add_argument('--sample_and_exit', action='store_true')
+parser.add_argument('--fixed_image_size', action='store_true')
 args = parser.parse_args()
 
 if args.load_from:
@@ -78,6 +79,30 @@ else:
         soft_prompter=SoftPrompter(1536, length=1)
     )
 
+def get_dataloader(data_config, batch_size=args.batch_size):
+    if args.fixed_image_size:
+        resolution = 256
+        aspect_ratio_type = 'ASPECT_RATIO_256'
+        data_config['type'] = 'FlexibleInternalData'
+    else:
+        resolution = 512
+        aspect_ratio_type = 'ASPECT_RATIO_512'
+        data_config['type'] = 'FlexibleInternalDataMS'
+    
+    dataset = build_dataset(
+        data_config, resolution=resolution, aspect_ratio_type=aspect_ratio_type,
+        real_prompt_ratio=1.0, max_length=77
+    )
+    if args.fixed_image_size:
+        dataloader = build_dataloader(dataset, batch_size=batch_size, num_workers=10)
+    else:
+        batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(dataset), dataset=dataset,
+                                            batch_size=batch_size, aspect_ratios=dataset.aspect_ratio, drop_last=True,
+                                            ratio_nums=dataset.ratio_nums, valid_num=0)
+        dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=10)
+    
+    return dataloader
+
 data_config = {
     'type': 'FlexibleInternalData',
     'roots': [
@@ -90,25 +115,17 @@ data_config = {
     'load_t5_feat': False,
     'transform': 'default_train'
 }
-val_dataset = build_dataset(
-    data_config, resolution=256, aspect_ratio_type='ASPECT_RATIO_512',
-    real_prompt_ratio=1.0, max_length=77
-)
-val_loader = build_dataloader(val_dataset, batch_size=1, num_workers=10)
+val_loader = get_dataloader(data_config, batch_size=1)
 
 if not args.sample_and_exit:
     data_config = {
         # 'type': 'FlexibleInternalDataMS',
         'type': 'FlexibleInternalData',
         'roots': [
-            # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
             '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
             # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
-            # '/mnt/bn/aigc-us/zjl/openimages/data/',
-            # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
         ],
         'json_lst': [
-            # '/mnt/bn/us-aigc-temp/henry/test.json',
             '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
             # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json'
         ],
@@ -116,15 +133,7 @@ if not args.sample_and_exit:
         'load_t5_feat': False,
         'transform': 'default_train'
     }
-    dataset = build_dataset(
-        data_config, resolution=256, aspect_ratio_type='ASPECT_RATIO_512',
-        real_prompt_ratio=1.0, max_length=77
-    )
-    # batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(dataset), dataset=dataset,
-    #                                     batch_size=args.batch_size, aspect_ratios=dataset.aspect_ratio, drop_last=True,
-    #                                     ratio_nums=dataset.ratio_nums, valid_num=0)
-    # dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=10)
-    dataloader = build_dataloader(dataset, batch_size=args.batch_size, num_workers=10)
+    dataloader = get_dataloader(data_config)
 else:
     dataloader = val_loader
 
