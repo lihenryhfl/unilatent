@@ -40,7 +40,7 @@ class InternalData(Dataset):
         self.N = int(resolution // (input_size // patch_size))
         self.mask_ratio = mask_ratio
         self.load_mask_index = load_mask_index
-        self.max_lenth = max_length
+        self.max_length = max_length
         self.meta_data_clean = []
         self.img_samples = []
         self.txt_feat_samples = []
@@ -97,9 +97,9 @@ class InternalData(Dataset):
         attention_mask = torch.ones(1, 1, txt_fea.shape[1])     # 1x1xT
         if 'attention_mask' in txt_info.keys():
             attention_mask = torch.from_numpy(txt_info['attention_mask'])[None]
-        if txt_fea.shape[1] != self.max_lenth:
-            txt_fea = torch.cat([txt_fea, txt_fea[:, -1:].repeat(1, self.max_lenth-txt_fea.shape[1], 1)], dim=1)
-            attention_mask = torch.cat([attention_mask, torch.zeros(1, 1, self.max_lenth-attention_mask.shape[-1])], dim=-1)
+        if txt_fea.shape[1] != self.max_length:
+            txt_fea = torch.cat([txt_fea, txt_fea[:, -1:].repeat(1, self.max_length-txt_fea.shape[1], 1)], dim=1)
+            attention_mask = torch.cat([attention_mask, torch.zeros(1, 1, self.max_length-attention_mask.shape[-1])], dim=-1)
 
         if self.transform:
             img = self.transform(img)
@@ -184,7 +184,7 @@ class InternalDataSigma(Dataset):
         self.load_mask_index = load_mask_index
         self.mask_type = mask_type
         self.real_prompt_ratio = real_prompt_ratio
-        self.max_lenth = max_length
+        self.max_length = max_length
         self.meta_data_clean = []
         self.img_samples = []
         self.txt_samples = []
@@ -241,8 +241,10 @@ class InternalDataSigma(Dataset):
 
     def getdata(self, index):
         img_path = self.img_samples[index]
-        real_prompt = random.random() < self.real_prompt_ratio
+        rand = random.random()
+        real_prompt = rand < self.real_prompt_ratio
         npz_path = self.txt_feat_samples[index] if real_prompt else self.gpt4v_txt_feat_samples[index]
+        assert real_prompt, f"{rand < self.real_prompt_ratio}, {rand}, {self.real_prompt_ratio}"
         txt = self.txt_samples[index] if real_prompt else self.sharegpt4v_txt_samples[index]
         npy_path = self.vae_feat_samples[index]
         data_info = {'img_hw': torch.tensor([torch.tensor(self.resolution), torch.tensor(self.resolution)], dtype=torch.float32),
@@ -250,18 +252,20 @@ class InternalDataSigma(Dataset):
 
         if self.load_vae_feat:
             img = self.loader(npy_path)
+            assert False
         else:
             img = self.loader(img_path)
 
-        attention_mask = torch.ones(1, 1, self.max_lenth)     # 1x1xT
+        attention_mask = torch.ones(1, 1, self.max_length)     # 1x1xT
         if self.load_t5_feat:
             txt_info = np.load(npz_path)
             txt_fea = torch.from_numpy(txt_info['caption_feature'])     # 1xTx4096
             if 'attention_mask' in txt_info.keys():
                 attention_mask = torch.from_numpy(txt_info['attention_mask'])[None]
-            if txt_fea.shape[1] != self.max_lenth:
-                txt_fea = torch.cat([txt_fea, txt_fea[:, -1:].repeat(1, self.max_lenth-txt_fea.shape[1], 1)], dim=1)
-                attention_mask = torch.cat([attention_mask, torch.zeros(1, 1, self.max_lenth-attention_mask.shape[-1])], dim=-1)
+            if txt_fea.shape[1] != self.max_length:
+                txt_fea = torch.cat([txt_fea, txt_fea[:, -1:].repeat(1, self.max_length-txt_fea.shape[1], 1)], dim=1)
+                attention_mask = torch.cat([attention_mask, torch.zeros(1, 1, self.max_length-attention_mask.shape[-1])], dim=-1)
+            assert False
         else:
             txt_fea = txt
 
@@ -269,6 +273,9 @@ class InternalDataSigma(Dataset):
             img = self.transform(img)
 
         data_info["mask_type"] = self.mask_type
+        assert img is not None
+        assert txt_fea is not None
+        assert data_info is not None
         return img, txt_fea, attention_mask.to(torch.int16), data_info
 
     def __getitem__(self, idx):
@@ -279,6 +286,7 @@ class InternalDataSigma(Dataset):
             except Exception as e:
                 print(f"Error details {self.img_samples[idx]}: {str(e)}")
                 idx = np.random.randint(len(self))
+                raise e
         raise RuntimeError('Too many bad data.')
 
     def get_data_info(self, idx):

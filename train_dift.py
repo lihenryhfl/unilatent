@@ -1,3 +1,5 @@
+import os
+import json
 import argparse
 import torch
 from diffusers import StableDiffusion3Pipeline
@@ -20,16 +22,17 @@ from transformers import (
 
 # from caption_decoder import TextDecoder
 from caption_decoder_v1 import TextDecoder
-from utils import ReLength, EmbedAdapter
+from utils import ReLength, EmbedAdapter, SoftPrompter
 
 from transformer import SD3Transformer2DModel
 
 parser = argparse.ArgumentParser(description="Training.")
 parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2text/', help='the dir to save logs and models')
 parser.add_argument('--load_from', default='', help='the dir to load logs and models')
-parser.add_argument('--batch_size', type=int, default=48)
+parser.add_argument('--batch_size', type=int, default=32)
 parser.add_argument('--block_num', type=int, default=4)
 parser.add_argument('--index', type=int, default=500)
+parser.add_argument('--sample_and_exit', action='store_true')
 args = parser.parse_args()
 
 if args.load_from:
@@ -42,7 +45,7 @@ else:
     pipe.decoder_tokenizer = decoder_tokenizer
 
     text_decoder = TextDecoder(
-        prefix_length=512,
+        prefix_length=256,
         prefix_inner_dim=1536,
         prefix_hidden_dim=1536,
         vocab_size=decoder_tokenizer.vocab_size + 1)
@@ -71,34 +74,59 @@ else:
         clip_image_processor=pipe.clip_image_processor,
         text_decoder=pipe.text_decoder,
         decoder_tokenizer=pipe.decoder_tokenizer,
-        image_encoder_adapter=image_encoder_adapter
+        image_encoder_adapter=image_encoder_adapter,
+        soft_prompter=SoftPrompter(1536, length=1)
     )
 
 data_config = {
-    'type': 'FlexibleInternalDataMS',
+    'type': 'FlexibleInternalData',
     'roots': [
-        # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
-        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
-        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
-        # '/mnt/bn/aigc-us/zjl/openimages/data/',
-        # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
+        '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
     ],
     'json_lst': [
-        # '/mnt/bn/us-aigc-temp/henry/test.json',
-        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
-        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json'
+        '/mnt/bn/us-aigc-temp/henry/test.json',
     ],
     'load_vae_feat': False,
-    'load_t5_feat': False
+    'load_t5_feat': False,
+    'transform': 'default_train'
 }
-dataset = build_dataset(
-    data_config, resolution=512, aspect_ratio_type='ASPECT_RATIO_512',
-    real_prompt_ratio=0.0, max_length=77,
+val_dataset = build_dataset(
+    data_config, resolution=256, aspect_ratio_type='ASPECT_RATIO_512',
+    real_prompt_ratio=1.0, max_length=77
 )
-batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(dataset), dataset=dataset,
-                                    batch_size=args.batch_size, aspect_ratios=dataset.aspect_ratio, drop_last=True,
-                                    ratio_nums=dataset.ratio_nums, valid_num=0)
-dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=10)
+val_loader = build_dataloader(val_dataset, batch_size=1, num_workers=10)
+
+if not args.sample_and_exit:
+    data_config = {
+        # 'type': 'FlexibleInternalDataMS',
+        'type': 'FlexibleInternalData',
+        'roots': [
+            # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
+            '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
+            # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
+            # '/mnt/bn/aigc-us/zjl/openimages/data/',
+            # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
+        ],
+        'json_lst': [
+            # '/mnt/bn/us-aigc-temp/henry/test.json',
+            '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
+            # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json'
+        ],
+        'load_vae_feat': False,
+        'load_t5_feat': False,
+        'transform': 'default_train'
+    }
+    dataset = build_dataset(
+        data_config, resolution=256, aspect_ratio_type='ASPECT_RATIO_512',
+        real_prompt_ratio=1.0, max_length=77
+    )
+    # batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(dataset), dataset=dataset,
+    #                                     batch_size=args.batch_size, aspect_ratios=dataset.aspect_ratio, drop_last=True,
+    #                                     ratio_nums=dataset.ratio_nums, valid_num=0)
+    # dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=10)
+    dataloader = build_dataloader(dataset, batch_size=args.batch_size, num_workers=10)
+else:
+    dataloader = val_loader
 
 num_epochs = 2
 
@@ -160,46 +188,73 @@ pipe = pipe.to(accelerator.device)
 
 print(f"TOTAL TRANSFORMER LAYERS: {len(pipe.transformer.transformer_blocks)} | OUR CHOSEN BLOCK: {args.block_num}")
 
-for epoch in range(num_epochs):
-    # progbar = tqdm(dataloader, mininterval=30, disable=not accelerator.is_main_process)
-    progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
-    for step, batch in enumerate(progbar):
-        optimizer.zero_grad()
-        
-        # prepare data
-        image, prompt = batch[0].to('cuda'), truncate(batch[1])
-        batch[1] = [x.strip('<|endoftext|>') for x in batch[1]]
-        # index = torch.randint(0, 1000, size=(len(image) * 2,))
-        index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
-
-        # run model
+def sample(batch):
+    with torch.no_grad():
+        image = batch[0].to('cuda')
+        index = torch.zeros(size=(1,), dtype=torch.long) + args.index
         embeds, pooled_embeds = pipe.dift_features(image, index, return_layer=args.block_num)
+        embeds = torch.cat([embeds[:1], pooled_embeds[:1]], axis=1)
+        decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
+                            eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
+        decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
+    return decoded_text
 
-        loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
-        accelerator.backward(loss)
-
-        grad_norm = accelerator.clip_grad_norm_(pipe.parameters(), 0.01)
-
-        for p in pipe.parameters():
-            if p.grad is not None:
-                torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
-
-        optimizer.step()
-        lr_scheduler.step()
+if args.sample_and_exit:
+    save_path = os.path.join(args.work_dir, 'captions.json')
+    print("Saving to", save_path)
+    json_list = []
+    progbar = tqdm(val_loader)
+    for i, batch in enumerate(progbar):
+        decoded_text = sample(batch)[0]
         
-        progbar.set_description(f"loss: {loss.item():.3f}")
+        caption = decoded_text.strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '').strip()
+        image_id = batch[-1]['image_id'].item() if 'image_id' in batch[-1] else 0
+        json_list.append({'image_id': image_id, 'caption': caption})
+        progbar.set_description(f"Image: {i:05d} | Predicted: {caption} | True: {batch[1][0]}")
 
-        if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
-            if (step + 1) % 10000 == 0 or step == 10:
-                pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
-                print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
+        if (i + 1) % 100 == 0:
+            with open(save_path, 'w') as f:
+                json.dump(json_list, f)
+else:
+    for epoch in range(num_epochs):
+        # progbar = tqdm(dataloader, mininterval=30, disable=not accelerator.is_main_process)
+        progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
+        for step, batch in enumerate(progbar):
+            optimizer.zero_grad()
+            
+            # prepare data
+            image, prompt = batch[0].to('cuda'), truncate(batch[1])
+            batch[1] = [x.strip('<|endoftext|>') for x in batch[1]]
+            index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
 
-            embeds = torch.cat([embeds[:1], pooled_embeds[:1]], axis=1)
-            decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
-                                eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
-            decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
-            print(
-                f"Recon: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace(' <|EOS|>', '')} | "
-                f"True: {batch[1][0]}"
-            )
+            # run model
+            embeds, pooled_embeds = pipe.dift_features(image, index, return_layer=args.block_num)
+
+            loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+            accelerator.backward(loss)
+
+            grad_norm = accelerator.clip_grad_norm_(pipe.parameters(), 0.01)
+
+            for p in pipe.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
+
+            optimizer.step()
+            lr_scheduler.step()
+            
+            progbar.set_description(f"loss: {loss.item():.3f}")
+
+            if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
+                if (step + 1) % 10000 == 0 or step == 10:
+                    pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
+                    print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
+
+                embeds = torch.cat([embeds[:1], pooled_embeds[:1]], axis=1)
+                decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
+                                    eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
+                decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
+                print(
+                    f"Recon: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace(' <|EOS|>', '')} | "
+                    f"True: {batch[1][0]}"
+                )
     

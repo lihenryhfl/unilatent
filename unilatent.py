@@ -28,7 +28,7 @@ from transformers import (
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from caption_decoder_v1 import TextDecoder
-from utils import pad_mask, EmbedAdapter
+from utils import pad_mask, EmbedAdapter, SoftPrompter
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin
@@ -180,7 +180,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->text_decoder->clip_image_encoder->transformer->vae"
-    _optional_components = ['image_encoder_adapter']
+    _optional_components = ['image_encoder_adapter', 'soft_prompter']
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
 
     def __getattribute__(self, name):
@@ -207,6 +207,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         text_decoder: TextDecoder,# = None,
         decoder_tokenizer: GPT2Tokenizer,# = None,
         image_encoder_adapter: EmbedAdapter = None,
+        soft_prompter: SoftPrompter = None
     ):
         super().__init__()
         
@@ -228,7 +229,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             clip_image_processor=clip_image_processor,
             text_decoder=text_decoder,
             decoder_tokenizer=decoder_tokenizer,
-            image_encoder_adapter=image_encoder_adapter
+            image_encoder_adapter=image_encoder_adapter,
+            soft_prompter=soft_prompter
         )
         self.text_encoder_3 = None
         self.tokenizer_3 = None
@@ -1067,6 +1069,10 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         B, N, C = embed.shape
         joint_embed = torch.cat([embed, pooled_embed.reshape(B, 1, C)], axis=1)
 
+        if self._hasattr('soft_prompter'):
+            embed, pooled_embed = self.soft_prompter(embed, pooled_embed)
+            assert False
+
         processed_prompt = [self.decoder_tokenizer.bos_token + txt + self.decoder_tokenizer.eos_token for txt in prompt]
         tokens = self.decoder_tokenizer(processed_prompt, return_tensors='pt', truncation=True, 
                                      max_length=120, padding="longest")
@@ -1104,7 +1110,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
                 )
 
         if return_layer:
-            return model_output.sample, model_output.hidden, target
+            return model_output.hidden, target
 
         return model_output.sample, target
         
@@ -1142,7 +1148,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     def dift_features(self, image, index, return_layer=4):
         prompt_embeds, pooled_prompt_embeds = self.encode_text("")
         
-        _, (_, hidden), _ = self.embed_to_denoiser(
+        (_, hidden), _ = self.embed_to_denoiser(
             image,
             prompt_embeds,
             pooled_prompt_embeds,
@@ -1152,7 +1158,16 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         # pooled_hidden = hidden.max(axis=1, keepdims=True)[0]
         # hidden, pooled_hidden = self.image_encoder_adapter(hidden, pooled_hidden)
         # return hidden, pooled_hidden
-        hidden = hidden[:, :512]
+        # hidden = hidden[:, :512]
         # basic conversion to work with our framework
         return hidden[:, :-1], hidden[:, -1:]
         
+    def _hasattr(self, name):
+        if not hasattr(self, name):
+            return False
+        elif getattr(self, name) is None:
+            return False
+        elif isinstance(getattr(self, name), list) and getattr(self, name)[0] is None:
+            return False
+
+        return True

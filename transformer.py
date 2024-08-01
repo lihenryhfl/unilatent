@@ -340,7 +340,9 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                 )
 
             if return_layer is not None and index_block == return_layer:
+                assert encoder_hidden_states is not None and hidden_states is not None
                 return_hidden = encoder_hidden_states, hidden_states
+                return CustomTransformer2DModelOutput(sample=torch.zeros_like(hidden_states) / 0, hidden=return_hidden)
 
             # controlnet residual
             if block_controlnet_hidden_states is not None and block.context_pre_only is False:

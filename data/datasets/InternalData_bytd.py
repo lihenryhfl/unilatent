@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import random
 from torchvision.datasets.folder import default_loader
-from data.datasets.InternalData import replace_img_ext
+from data.datasets.InternalData import replace_img_ext, InternalDataSigma
 from data.datasets.InternalData_ms import InternalDataMSSigma, get_closest_ratio
 from data.builder import get_data_path, DATASETS
 import torchvision.transforms as T
@@ -15,6 +15,96 @@ def get_closest_ratio(height: float, width: float, ratios: dict):
     aspect_ratio = height / width
     closest_ratio = min(ratios.keys(), key=lambda ratio: abs(float(ratio) - aspect_ratio))
     return ratios[closest_ratio], float(closest_ratio)
+
+@DATASETS.register_module()
+class FlexibleInternalData(InternalDataSigma):
+    def __init__(self,
+                 roots,       # a list of root that has the same length as image_list_json_lst
+                 json_lst=None,   # a list of json file, each json file contains a list of dict, each dict contains the info of an image and its caption
+                 transform=None,
+                 resolution=256,
+                 sample_subset=None,
+                 load_vae_feat=False,
+                 load_t5_feat=False,
+                 input_size=32,
+                 patch_size=2,
+                 mask_ratio=0.0,
+                 mask_type='null',
+                 load_mask_index=False,
+                 real_prompt_ratio=1.0,
+                 max_length=300,
+                 return_image_id=False,
+                 config=None,
+                 **kwargs):
+
+        roots = [get_data_path(root) for root in roots]
+        assert real_prompt_ratio == 1.0, real_prompt_ratio
+        self.transform = transform
+        self.load_vae_feat = load_vae_feat
+        self.load_t5_feat = load_t5_feat
+        self.ori_imgs_nums = 0
+        self.resolution = resolution
+        self.N = int(resolution // (input_size // patch_size))
+        self.mask_ratio = mask_ratio
+        self.load_mask_index = load_mask_index
+        self.mask_type = mask_type
+        self.real_prompt_ratio = real_prompt_ratio
+        self.max_length = max_length
+        self.base_size = int(kwargs['aspect_ratio_type'].split('_')[-1])
+        self.aspect_ratio = eval(kwargs.pop('aspect_ratio_type'))       # base aspect ratio
+        self.return_image_id = return_image_id
+
+        self.meta_data_clean = []
+        self.img_samples = []
+        self.txt_samples = []
+        self.txt_feat_samples = []
+        self.vae_feat_samples = []
+        self.mask_index_samples = []
+        self.ratio_index = {}
+        self.ratio_nums = {}
+
+        self.weight_dtype = torch.float16 if self.real_prompt_ratio > 0 else torch.float32
+        self.interpolate_model = InterpolationMode.BICUBIC
+        if self.aspect_ratio in [ASPECT_RATIO_2048, ASPECT_RATIO_2880]:
+            self.interpolate_model = InterpolationMode.LANCZOS
+        for k, v in self.aspect_ratio.items():
+            self.ratio_index[float(k)] = []     # used for self.getitem
+            self.ratio_nums[float(k)] = 0      # used for batch-sampler
+
+        if not json_lst:
+            json_lst = [os.path.join(root, 'meta_data.json') for root in roots]
+
+        for root, json_file in zip(roots, json_lst):
+
+            meta_data = self.load_json(os.path.join(root, json_file))
+            self.ori_imgs_nums += len(meta_data)
+            meta_data_clean = [item for item in meta_data if item['ratio'] <= 4.5]
+            self.meta_data_clean.extend(meta_data_clean)
+            self.img_samples.extend([
+                os.path.join(root, item['image_path']) for item in meta_data_clean
+            ])
+            self.txt_samples.extend([item['caption'] for item in meta_data_clean])
+
+        self.gpt4v_txt_feat_samples = [None] * len(self.txt_samples)
+        self.txt_feat_samples = [None] * len(self.txt_samples)
+        self.sharegpt4v_txt_samples = [None] * len(self.txt_samples)
+        self.vae_feat_samples = [None] * len(self.txt_samples)
+
+        # Set loader and extensions
+        if load_vae_feat:
+            self.transform = None
+            self.loader = self.vae_feat_loader
+        else:
+            self.loader = default_loader
+
+    def getdata(self, index):
+        img, txt_fea, attention_mask, data_info = super().getdata(index)
+        if 'image_id' in self.meta_data_clean[index]:
+            data_info['image_id'] = self.meta_data_clean[index]['image_id']
+        else:
+            assert False
+
+        return img, txt_fea, attention_mask, data_info
 
 @DATASETS.register_module()
 class FlexibleInternalDataMS(InternalDataMSSigma):
@@ -31,7 +121,7 @@ class FlexibleInternalDataMS(InternalDataMSSigma):
                  mask_ratio=0.0,
                  mask_type='null',
                  load_mask_index=False,
-                 real_prompt_ratio=0.0,
+                 real_prompt_ratio=1.0,
                  max_length=300,
                  return_image_id=False,
                  config=None,

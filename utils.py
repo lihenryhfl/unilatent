@@ -109,3 +109,13 @@ class EmbedAdapter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
             x = self.relength(x)
 
         return x, x_pooled
+
+class SoftPrompter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
+    @register_to_config
+    def __init__(self, d_model, length=1, std=0.):
+        super().__init__()
+        self.register_buffer('soft_prompt', torch.randn(size=(1, length, d_model)) * std)
+        self.register_buffer('pooled_soft_prompt', torch.randn(size=(1, 1, d_model)) * std)
+
+    def forward(self, x, x_pooled):
+        return x + self.soft_prompt, x_pooled + self.pooled_soft_prompt
