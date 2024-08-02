@@ -227,8 +227,8 @@ if args.sample_and_exit:
     save_path = os.path.join(args.work_dir, 'captions.json')
     print("Saving to", save_path)
     json_list = []
-    # progbar = tqdm(val_loader)
-    progbar = tqdm(dataloader)
+    progbar = tqdm(val_loader)
+    # progbar = tqdm(dataloader)
     for i, batch in enumerate(progbar):
         decoded_text = sample(batch)[0]
         
