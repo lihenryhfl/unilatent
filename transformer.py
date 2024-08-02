@@ -262,7 +262,7 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         block_controlnet_hidden_states: List = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-        return_layer: int = None,
+        return_layers: Optional[List[int]] = None,
     ) -> Union[torch.FloatTensor, CustomTransformer2DModelOutput]:
         """
         The [`SD3Transformer2DModel`] forward method.
@@ -311,8 +311,12 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         temb = self.time_text_embed(timestep, pooled_projections)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        return_hidden = None
+        return_hidden, return_encoder_hidden = [], []
         reported = False
+
+        if return_layers is not None:
+            assert isinstance(return_layers, list) or isinstance(return_layers, tuple), type(return_layers)
+            return_layers = sorted(return_layers)
 
         for index_block, block in enumerate(self.transformer_blocks):
             assert encoder_hidden_states is not None and hidden_states is not None, index_block
@@ -347,11 +351,13 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                     hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states, temb=temb
                 )
 
-            if return_layer is not None and index_block == return_layer:
+            if return_layers is not None and index_block in return_layers:
                 assert encoder_hidden_states is not None and hidden_states is not None
-                return_hidden = encoder_hidden_states, hidden_states
-                assert isinstance(return_hidden[0], torch.Tensor)
-                return CustomTransformer2DModelOutput(sample=torch.zeros_like(return_hidden[0]) / 0, hidden=return_hidden)
+                return_hidden.append(hidden_states)
+                return_encoder_hidden.append(encoder_hidden_states)
+                if index_block == return_layers[-1]:
+                    return_hidden = torch.cat(return_encoder_hidden, axis=-1), torch.cat(return_hidden, axis=-1)
+                    return CustomTransformer2DModelOutput(sample=torch.zeros_like(return_hidden[0]) / 0, hidden=return_hidden)
 
             # controlnet residual
             if block_controlnet_hidden_states is not None and block.context_pre_only is False:
@@ -381,4 +387,4 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         if not return_dict:
             return (output,)
 
-        return CustomTransformer2DModelOutput(sample=output, hidden=return_hidden)
+        return CustomTransformer2DModelOutput(sample=output)

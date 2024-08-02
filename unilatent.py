@@ -1081,7 +1081,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         
         return self.embed_to_decoder(image_embed, pooled_image_embed, prompt)
 
-    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, return_layer=None):
+    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, return_layers=None):
         latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
         latent = (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
@@ -1102,10 +1102,10 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
                     encoder_hidden_states=prompt_embeds,
                     pooled_projections=pooled_prompt_embeds,
                     joint_attention_kwargs=None,
-                    return_layer=return_layer
+                    return_layers=return_layers
                 )
 
-        if return_layer:
+        if return_layers:
             return model_output.hidden, target
 
         return model_output.sample, target
@@ -1141,30 +1141,31 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
 
 ######################## FOR DIFT #########################
-    def dift_features(self, image, index, return_layer=12, num_aggregation_steps=5):
-        prompt_embeds, pooled_prompt_embeds = self.encode_text("")
+    def dift_features(self, image, index, embed=None, pooled_embed=None, return_layers=12, num_aggregation_steps=1):
+        if not (isinstance(return_layers, list) or isinstance(return_layers, tuple)):
+            return_layers = [return_layers]
+        
+        if embed is None:
+            embed, pooled_embed = self.encode_text("")
 
         if self._hasattr('soft_prompter'):
-            prompt_embeds, pooled_prompt_embeds = self.soft_prompter(prompt_embeds, pooled_prompt_embeds)
+            embed, pooled_embed = self.soft_prompter(embed, pooled_embed)
             assert False
         
         hidden_list = []
         for i in range(num_aggregation_steps):
             (_, hidden), _ = self.embed_to_denoiser(
                 image,
-                prompt_embeds,
-                pooled_prompt_embeds,
+                embed, 
+                pooled_embed,
                 index,
-                return_layer=return_layer)
+                return_layers=return_layers)
             hidden_list.append(hidden)
         
         # aggregate hidden
         hidden = torch.stack(hidden_list).mean(dim=0)
 
-        # pooled_hidden = hidden.max(axis=1, keepdims=True)[0]
-        # hidden, pooled_hidden = self.image_encoder_adapter(hidden, pooled_hidden)
-        # return hidden, pooled_hidden
-        assert hidden.shape[1] >= self.text_decoder.prefix_length
+        assert hidden.shape[1] >= self.text_decoder.prefix_length, f"{hidden.shape, self.text_decoder.prefix_length}"
         hidden = hidden[:, :self.text_decoder.prefix_length]
         # basic conversion to work with our framework
         return hidden[:, :-1], hidden[:, -1:]

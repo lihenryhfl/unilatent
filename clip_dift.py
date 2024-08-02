@@ -42,40 +42,14 @@ print("BLOCK NUM", args.block_num)
 if args.load_from:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 else:
-    pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float32)
+    pipe = UniLatentPipeline.from_pretrained('/mnt/bn/us-aigc-temp/henry/data/unilatent/train_all_2_8gpu/current/', torch_dtype=torch.float32)
 
     decoder_tokenizer = GPT2Tokenizer.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt_tokenizer/')
     decoder_tokenizer.add_special_tokens({'pad_token': decoder_tokenizer.eos_token})
     pipe.decoder_tokenizer = decoder_tokenizer
 
-    if args.image_size == -1:
-        prefix_length = 512
-    elif args.image_size == 256:
-        prefix_length = int(args.image_size ** 2 / 16 ** 2)
-        assert prefix_length == 256, prefix_length
-    elif args.image_size == 512:
-        prefix_length = int(args.image_size ** 2 / 16 ** 2)
-        assert prefix_length == 1024, prefix_length
-    else:
-        print("USING IMAGE SIZE", args.image_size)
-        prefix_length = int(args.image_size ** 2 / 16 ** 2)
-
-    text_decoder = TextDecoder(
-        prefix_length=prefix_length,
-        prefix_inner_dim=1536 * len(args.block_num),
-        prefix_hidden_dim=1536,
-        vocab_size=decoder_tokenizer.vocab_size + 1)
+    text_decoder = TextDecoder(prefix_length=512, prefix_inner_dim=1536, prefix_hidden_dim=1536, vocab_size=decoder_tokenizer.vocab_size + 1)
     pipe.text_decoder = text_decoder
-
-    pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
-    pipe.clip_image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
-
-    transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
-    transformer.load_state_dict(pipe.transformer.state_dict())
-    pipe.transformer = transformer
-
-    # image_encoder_adapter = EmbedAdapter(input_dim=1536, output_dim=1536, output_length=511, n_heads=16)
-    image_encoder_adapter = None
 
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
@@ -89,7 +63,7 @@ else:
         clip_image_processor=pipe.clip_image_processor,
         text_decoder=pipe.text_decoder,
         decoder_tokenizer=pipe.decoder_tokenizer,
-        image_encoder_adapter=image_encoder_adapter,
+        image_encoder_adapter=pipe.image_encoder_adapter,
     )
 
 def get_dataloader(data_config, val=False):
@@ -256,13 +230,14 @@ else:
             batch[1] = [x.strip('<|endoftext|>') for x in batch[1]]
             index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
 
+            image_embeds, pooled_image_embeds = pipe.encode_image(image, dtype=torch.float16)
+
             # run model
-            embeds, pooled_embeds = pipe.dift_features(image, index, return_layers=args.block_num)
+            embeds, pooled_embeds = pipe.dift_features(
+                image, index, embed=image_embeds, pooled_embed=pooled_image_embeds, return_layers=args.block_num)
 
             loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
             accelerator.backward(loss)
-
-            # grad_norm = accelerator.clip_grad_norm_(pipe.parameters(), 0.01)
 
             for p in pipe.parameters():
                 if p.grad is not None:
