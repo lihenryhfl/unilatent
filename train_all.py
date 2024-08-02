@@ -1,3 +1,4 @@
+import json
 import os
 import argparse
 import torch
@@ -29,6 +30,7 @@ parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2
 parser.add_argument('--load_from', default='', help='the dir to load from')
 parser.add_argument('--batch_size', type=int, default=48)
 parser.add_argument('--step_offset', type=int, default=0)
+parser.add_argument('--sample_and_exit', action='store_true')
 args = parser.parse_args()
 
 if not args.load_from:
@@ -60,11 +62,12 @@ if not args.load_from:
         clip_image_processor=pipe.clip_image_processor,
         text_decoder=pipe.text_decoder,
         decoder_tokenizer=pipe.decoder_tokenizer,
+        image_encoder_adapter=EmbedAdapter(1024, 2048, 77)
     )
 else:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 
-pipe.register_modules(image_encoder_adapter=EmbedAdapter(1024, 2048, 77))
+pipe.register_modules(image_decoder_adapter=EmbedAdapter(2048, 2048, 77))
 
 val_data_config = {
     'type': 'FlexibleInternalDataMS',
@@ -86,44 +89,47 @@ val_batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(val_dataset), 
                                     ratio_nums=val_dataset.ratio_nums, valid_num=0)
 val_loader = build_dataloader(val_dataset, batch_sampler=val_batch_sampler, num_workers=10)
 
-data_config = {
-    'type': 'FlexibleInternalDataMS',
-    'roots': [
-        # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
-        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
-        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
-        # '/mnt/bn/aigc-us/zjl/openimages/data/',
-        # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
-    ],
-    'json_lst': [
-        # '/mnt/bn/us-aigc-temp/henry/test.json',
-        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
-        # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json',
-        # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json',
-        # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json'
-    ],
-    'load_vae_feat': False,
-    'load_t5_feat': False
-}
-dataset = build_dataset(
-    data_config, resolution=512, aspect_ratio_type='ASPECT_RATIO_512',
-    real_prompt_ratio=0.0, max_length=77,
-)
-batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(dataset), dataset=dataset,
-                                    batch_size=args.batch_size, aspect_ratios=dataset.aspect_ratio, drop_last=True,
-                                    ratio_nums=dataset.ratio_nums, valid_num=0)
-dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=10)
+if not args.sample_and_exit:
+    data_config = {
+        'type': 'FlexibleInternalDataMS',
+        'roots': [
+            # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
+            '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
+            # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
+            # '/mnt/bn/aigc-us/zjl/openimages/data/',
+            # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
+        ],
+        'json_lst': [
+            # '/mnt/bn/us-aigc-temp/henry/test.json',
+            '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
+            # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json',
+            # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json',
+            # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json'
+        ],
+        'load_vae_feat': False,
+        'load_t5_feat': False
+    }
+    dataset = build_dataset(
+        data_config, resolution=512, aspect_ratio_type='ASPECT_RATIO_512',
+        real_prompt_ratio=0.0, max_length=77,
+    )
+    batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(dataset), dataset=dataset,
+                                        batch_size=args.batch_size, aspect_ratios=dataset.aspect_ratio, drop_last=True,
+                                        ratio_nums=dataset.ratio_nums, valid_num=0)
+    dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=10)
+else:
+    dataloader = val_loader
 
 num_epochs = 2
 
 # models = [pipe.text_decoder]
 # models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
 # models = [pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2, pipe.image_encoder_adapter]
-models = [pipe.text_decoder, pipe.image_encoder_adapter]
-# models2 = [pipe.image_encoder_adapter]
+models = [pipe.text_decoder, pipe.image_encoder_adapter, pipe.image_decoder_adapter]
+models2 = [pipe.text_encoder, pipe.text_encoder_2, pipe.clip_image_encoder]
 
 optimizer = torch.optim.AdamW(lr=5e-5, params=pipe.parameters(models=models))
-# optimizer.add_param_group(dict(params=pipe.parameters(models=models2), lr=5e-5, weight_decay=1e-1))
+optimizer.add_param_group(dict(params=pipe.parameters(models=models2), lr=1e-6))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=1000,
@@ -133,7 +139,7 @@ lr_scheduler = get_cosine_schedule_with_warmup(
 for p in pipe.parameters():
     p.requires_grad = False
 
-for p in pipe.parameters(models=models):# + models2):
+for p in pipe.parameters(models=models + models2):
     p.requires_grad = True
 
 accelerator = Accelerator(
@@ -164,6 +170,7 @@ def truncate(texts):
 
 optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
 
+pipe = pipe.to(accelerator.device)
 def prepare(pipe):
     (
         pipe.transformer,
@@ -172,7 +179,8 @@ def prepare(pipe):
         pipe.clip_image_encoder,
         pipe.text_decoder,
         pipe.vae,
-        pipe.image_encoder_adapter
+        pipe.image_encoder_adapter,
+        pipe.image_decoder_adapter
     ) = accelerator.prepare(
         pipe.transformer,
         pipe.text_encoder, 
@@ -180,7 +188,8 @@ def prepare(pipe):
         pipe.clip_image_encoder,
         pipe.text_decoder,
         pipe.vae,
-        pipe.image_encoder_adapter
+        pipe.image_encoder_adapter,
+        pipe.image_decoder_adapter
     )
     return pipe
 
@@ -192,6 +201,7 @@ def unwrap(pipe):
     pipe.text_decoder = accelerator.unwrap_model(pipe.text_decoder)
     pipe.vae = accelerator.unwrap_model(pipe.vae)
     pipe.image_encoder_adapter = accelerator.unwrap_model(pipe.image_encoder_adapter)
+    pipe.image_decoder_adapter = accelerator.unwrap_model(pipe.image_decoder_adapter)
     return pipe
 
 def save(pipe, path):
@@ -208,12 +218,11 @@ pipe = prepare(pipe)
 def sample(batch):
     image, prompt = batch[0].to('cuda'), truncate(batch[1])
     with torch.no_grad():
-        # prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt[:1])
+        prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt[:1])
         image_embeds, pooled_image_embeds = pipe.encode_image(image[:1], dtype=torch.float16)
-        embeds = torch.cat([image_embeds, pooled_image_embeds], axis=1)
-        # embeds = torch.cat([prompt_embeds, image_embeds])
-        # pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds])
-        # embeds = torch.cat([embeds, pooled_embeds], axis=1)
+        embeds = torch.cat([prompt_embeds, image_embeds])
+        pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds])
+        embeds = torch.cat([embeds, pooled_embeds], axis=1)
         decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
                             eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
         decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
@@ -222,78 +231,96 @@ def sample(batch):
 d_losses = []
 c_losses = []
 
-for epoch in range(num_epochs):
-    # progbar = tqdm(dataloader, mininterval=30, disable=not accelerator.is_main_process)
-    progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
-    for step, batch in enumerate(progbar):
-        step = args.step_offset + step
-        optimizer.zero_grad()
+iter_val_loader = iter(val_loader)
+if args.sample_and_exit:
+    save_path = os.path.join(args.work_dir, 'captions.json')
+    print("Saving to", save_path)
+    json_list = []
+    progbar = tqdm(val_loader)
+    for i, batch in enumerate(progbar):
+        decoded_text = sample(batch)[1]
         
-        # prepare data
-        image, prompt = batch[0].to('cuda'), truncate(batch[1])
-        # index = torch.randint(0, 1000, size=(len(image) * 2,))
-        index = torch.randint(250, 500, size=(len(image) * 2,))
+        caption = decoded_text.strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '').strip()
+        image_id = batch[-1]['image_id'].item() if 'image_id' in batch[-1] else 0
+        json_list.append({'image_id': image_id, 'caption': caption})
+        progbar.set_description(f"Image: {i:05d} | Predicted: {caption} | True: {batch[1][0]}")
 
-        # run model
-        prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt)
-        image_embeds, pooled_image_embeds = pipe.encode_image(image, dtype=torch.float16)
+        if (i + 1) % 100 == 0:
+            with open(save_path, 'w') as f:
+                json.dump(json_list, f)
+else:
+    for epoch in range(num_epochs):
+        # progbar = tqdm(dataloader, mininterval=30, disable=not accelerator.is_main_process)
+        progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
+        for step, batch in enumerate(progbar):
+            step = args.step_offset + step
+            optimizer.zero_grad()
+            
+            # prepare data
+            image, prompt = batch[0].to('cuda'), truncate(batch[1])
+            # index = torch.randint(0, 1000, size=(len(image) * 2,))
+            index = torch.randint(250, 500, size=(len(image) * 2,))
 
-        # embeds = torch.cat([prompt_embeds, image_embeds], axis=0)
-        # pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds], axis=0)
-        # image = torch.cat([image, image], axis=0)
-        # prompt = prompt + prompt
-        embeds, pooled_embeds = image_embeds, pooled_image_embeds
+            # run model
+            prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt)
+            image_embeds, pooled_image_embeds = pipe.encode_image(image, dtype=torch.float16)
 
-        # model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
-        # d_loss = torch.nan_to_num(((model_output - target) ** 2).mean())
-        d_loss = torch.tensor(0., dtype=torch.float16, device=accelerator.device)
+            embeds = torch.cat([prompt_embeds, image_embeds], axis=0)
+            pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds], axis=0)
+            image = torch.cat([image, image], axis=0)
+            prompt = prompt + prompt
+            # embeds, pooled_embeds = image_embeds, pooled_image_embeds
 
-        c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
-        if not c_loss.isfinite().all():
-            print(f"c_loss has nan.")
-        c_loss = torch.nan_to_num(c_loss)
+            model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
+            d_loss = torch.nan_to_num(((model_output - target) ** 2).mean())
+            # d_loss = torch.tensor(0., dtype=torch.float16, device=accelerator.device)
 
-        loss = d_loss + c_loss
-        accelerator.backward(loss)
+            c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+            if not c_loss.isfinite().all():
+                print(f"c_loss has nan.")
+            c_loss = torch.nan_to_num(c_loss)
 
-        d_losses.append(d_loss.item())
-        c_losses.append(c_loss.item())
+            loss = d_loss + c_loss
+            accelerator.backward(loss)
 
-        num_params, num_nans = 0, 0
-        for p in pipe.parameters():
-            if p.grad is not None:
-                num_params += np.prod(p.shape)
-                num_nans += ((1 - p.grad.isfinite().int()).float()).sum()
-                torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
+            d_losses.append(d_loss.item())
+            c_losses.append(c_loss.item())
 
-        optimizer.step()
-        lr_scheduler.step()
-        
-        progbar.set_description(f"LOSSES: diff {np.mean(d_losses).item():02.3f} | ce {np.mean(c_losses).item():02.3f}")
+            num_params, num_nans = 0, 0
+            for p in pipe.parameters():
+                if p.grad is not None:
+                    num_params += np.prod(p.shape)
+                    num_nans += ((1 - p.grad.isfinite().int()).float()).sum()
+                    torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
 
-        if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
-            if (step + 1) % 500 == 0 or step == 10:
-                pipe = unwrap(pipe)
-                pipe.save_pretrained(f'{args.work_dir}/current/', safe_serialization=False)
-                # save(pipe, os.path.join(f'{args.work_dir}', 'current'))
-                print(f"Saved model to directory {f'{args.work_dir}/current/'}")
-            elif (step + 1) % 5000 == 0 or step == 10:
-                pipe = unwrap(pipe)
-                pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
-                print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
+            optimizer.step()
+            lr_scheduler.step()
+            
+            progbar.set_description(f"LOSSES: diff {np.mean(d_losses).item():02.3f} | ce {np.mean(c_losses).item():02.3f}")
 
-            d_losses = []
-            c_losses = []
+            if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
+                if (step + 1) % 500 == 0 or step == 10:
+                    # pipe = unwrap(pipe)
+                    pipe.save_pretrained(f'{args.work_dir}/current/')
+                    # save(pipe, os.path.join(f'{args.work_dir}', 'current'))
+                    print(f"Saved model to directory {f'{args.work_dir}/current/'}")
+                elif (step + 1) % 5000 == 0 or step == 10:
+                    pipe = unwrap(pipe)
+                    pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
+                    print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 
-            batch = next(iter(val_loader))
-            decoded_text = sample(batch)
-            # print(
-            #     f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
-            #     f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
-            #     f"True: {batch[1][0]}"
-            # )
-            print(
-                f"Recon from image: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
-                f"True: {batch[1][0]}"
-            )
+                d_losses = []
+                c_losses = []
+
+                batch = next(iter_val_loader)
+                decoded_text = sample(batch)
+                print(
+                    f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+                    f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+                    f"True: {batch[1][0]}"
+                )
+                # print(
+                #     f"Recon from image: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+                #     f"True: {batch[1][0]}"
+                # )
     

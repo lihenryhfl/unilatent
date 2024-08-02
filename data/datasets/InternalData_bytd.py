@@ -177,6 +177,7 @@ class FlexibleInternalDataMS(InternalDataMSSigma):
             except Exception as e:
                 print(f"Error details: {str(e)}")
                 idx = random.choice(self.ratio_index[self.closest_ratio])
+                raise e
         raise RuntimeError('Too many bad data.')
 
 

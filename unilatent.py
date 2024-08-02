@@ -1062,7 +1062,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         return prompt_embeds, pooled_prompt_embeds.reshape(B, 1, C)
 
     def embed_to_decoder(self, embed, pooled_embed, prompt):
-        assert (embed.shape[1] + 1) == self.text_decoder.prefix_length, embed.shape
+        assert (embed.shape[1] + 1) == self.text_decoder.prefix_length, f"{embed.shape}, {self.text_decoder.prefix_length}"
         B, N, C = embed.shape
         joint_embed = torch.cat([embed, pooled_embed.reshape(B, 1, C)], axis=1)
 
@@ -1081,7 +1081,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         
         return self.embed_to_decoder(image_embed, pooled_image_embed, prompt)
 
-    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, return_layer=None, apply_soft_prompt=False):
+    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, return_layer=None):
         latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
         latent = (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
@@ -1091,9 +1091,6 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         B, N, C = prompt_embeds.shape
         if self._hasattr('image_decoder_adapter'):
             prompt_embeds, pooled_prompt_embeds = self.image_decoder_adapter(prompt_embeds, pooled_prompt_embeds)
-
-        if apply_soft_prompt:
-            prompt_embeds, pooled_prompt_embeds = self.soft_prompter(prompt_embeds, pooled_prompt_embeds)
 
         prompt_embeds = self.format_clip_prompt_embeds(prompt_embeds)
         pooled_prompt_embeds = pooled_prompt_embeds.reshape(B, C)
@@ -1109,7 +1106,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
                 )
 
         if return_layer:
-            return model_output.sample, model_output.hidden, target
+            return model_output.hidden, target
 
         return model_output.sample, target
         
@@ -1147,20 +1144,21 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     def dift_features(self, image, index, return_layer=4):
         prompt_embeds, pooled_prompt_embeds = self.encode_text("")
         
-        _, (encoder_hidden, hidden), _ = self.embed_to_denoiser(
+        (encoder_hidden, hidden), _ = self.embed_to_denoiser(
             image,
             prompt_embeds,
             pooled_prompt_embeds,
             index,
             return_layer=return_layer,
-            apply_soft_prompt=True
             )
 
-        if self._hasattr('image_encoder_adapter'):
-            self.image_encoder_adapter.to(self.device)
-            hidden, hidden_pooled = self.image_encoder_adapter(hidden[:, :-1], hidden[:, -1:])
-        else:
-            hidden, hidden_pooled = hidden[:, :511], hidden[:, 511:512]
+        # prompt_embeds, pooled_prompt_embeds = self.soft_prompter(prompt_embeds, pooled_prompt_embeds)
+
+        # if self._hasattr('image_encoder_adapter'):
+        #     self.image_encoder_adapter.to(self.device)
+        #     hidden, hidden_pooled = self.image_encoder_adapter(hidden[:, :-1], hidden[:, -1:])
+        # else:
+        hidden, hidden_pooled = hidden[:, :511], hidden[:, 511:512]
         # basic conversion to work with our framework
         return hidden, hidden_pooled
 
