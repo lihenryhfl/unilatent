@@ -1022,7 +1022,6 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         sigma = self.scheduler.sigmas[index].to(sample.device).type(sample.dtype).reshape(-1, 1, 1, 1)
         noisy_sample = sigma * noise + (1.0 - sigma) * sample
 
-        # v_target = (1.0 - sigma) * noise - sigma * sample
         target = noise - sample
         
         return noisy_sample, self.scheduler.timesteps[index].to(sample.device).type(sample.dtype), target
@@ -1061,8 +1060,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         return prompt_embeds, pooled_prompt_embeds.reshape(B, 1, C)
 
-    def embed_to_decoder(self, embed, pooled_embed, prompt):
-        assert (embed.shape[1] + 1) == self.text_decoder.prefix_length, f"{embed.shape}, {self.text_decoder.prefix_length}"
+    def embed_to_decoder(self, embed, pooled_embed, prompt, suffix_input_ids=None):
+        # assert (embed.shape[1] + 1) == self.text_decoder.prefix_length, f"{embed.shape}, {self.text_decoder.prefix_length}"
         B, N, C = embed.shape
         joint_embed = torch.cat([embed, pooled_embed.reshape(B, 1, C)], axis=1)
 
@@ -1072,7 +1071,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         mask = pad_mask(tokens['attention_mask'], prefix_len=self.text_decoder.prefix_length).to(self.device)
         input_ids = tokens['input_ids'].to(self.device)
 
-        llm_out = self.text_decoder.forward(input_ids, joint_embed, attention_mask=mask)
+        llm_out = self.text_decoder.forward(input_ids, joint_embed, attention_mask=mask, suffix_input_ids=suffix_input_ids)
 
         return llm_out.loss
 
@@ -1141,7 +1140,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
 
 ######################## FOR DIFT #########################
-    def dift_features(self, image, index, embed=None, pooled_embed=None, return_layers=12, num_aggregation_steps=1):
+    def dift_features(self, image, index, embed=None, pooled_embed=None, 
+        return_layers=12, num_aggregation_steps=1, dataset_conditioning=False):
         if not (isinstance(return_layers, list) or isinstance(return_layers, tuple)):
             return_layers = [return_layers]
         
@@ -1165,8 +1165,12 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         # aggregate hidden
         hidden = torch.stack(hidden_list).mean(dim=0)
 
-        assert hidden.shape[1] >= self.text_decoder.prefix_length, f"{hidden.shape, self.text_decoder.prefix_length}"
-        hidden = hidden[:, :self.text_decoder.prefix_length]
+        prefix_length = self.text_decoder.prefix_length
+        if dataset_conditioning:
+            prefix_length = prefix_length - 1
+
+        assert hidden.shape[1] >= prefix_length, f"{hidden.shape, self.text_decoder.prefix_length}"
+        hidden = hidden[:, :prefix_length]
         # basic conversion to work with our framework
         return hidden[:, :-1], hidden[:, -1:]
 

@@ -32,20 +32,58 @@ parser.add_argument('--load_from', default='', help='the dir to load logs and mo
 parser.add_argument('--batch_size', type=int, default=32)
 parser.add_argument('--index', type=int, default=750)
 
-parser.add_argument('--block_num', nargs='+', type=int, default=12)
+parser.add_argument('--block_num', nargs='+', type=int, default='12')
 parser.add_argument('--image_size', type=int, default=-1)
 parser.add_argument('--sample_and_exit', action='store_true')
+parser.add_argument('--dataset_conditioning', action='store_true')
+parser.add_argument('--clip', action='store_true')
 args = parser.parse_args()
 
+args.block_num = [args.block_num] if not isinstance(args.block_num, list) else args.block_num
 print("BLOCK NUM", args.block_num)
+
+val_config = {
+    'type': 'FlexibleInternalData',
+    'roots': [
+        '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
+    ],
+    'json_lst': [
+        '/mnt/bn/us-aigc-temp/henry/test.json',
+    ],
+    'load_vae_feat': False,
+    'load_t5_feat': False,
+    'transform': 'default_train'
+}
+train_config = {
+    'roots': [
+        '/mnt/bn/us-aigc-temp/henry/coco_2014/train2014/',
+        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
+        
+    ],
+    'json_lst': [
+        '/mnt/bn/us-aigc-temp/henry/train.json',
+        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
+        
+    ],
+    'load_vae_feat': False,
+    'load_t5_feat': False,
+    'transform': 'default_train'
+}
+
+if args.dataset_conditioning:
+    train_config['roots'].append('/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/')
+    train_config['json_lst'].append('/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json')
 
 if args.load_from:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 else:
     pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float32)
-
+    add_vocab_size = 1
     decoder_tokenizer = GPT2Tokenizer.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt_tokenizer/')
     decoder_tokenizer.add_special_tokens({'pad_token': decoder_tokenizer.eos_token})
+    if args.dataset_conditioning:
+        decoder_tokenizer.add_tokens([f'<|dataset{i}|>' for i in range(len(train_config['roots']))])
+        add_vocab_size += len(train_config['roots'])
     pipe.decoder_tokenizer = decoder_tokenizer
 
     if args.image_size == -1:
@@ -60,11 +98,17 @@ else:
         print("USING IMAGE SIZE", args.image_size)
         prefix_length = int(args.image_size ** 2 / 16 ** 2)
 
+    if args.clip:
+        prefix_length = 258
+        prefix_dim = 1024
+    else:
+        prefix_dim = 1536 * len(args.block_num)
+
     text_decoder = TextDecoder(
         prefix_length=prefix_length,
-        prefix_inner_dim=1536 * len(args.block_num),
-        prefix_hidden_dim=1536,
-        vocab_size=decoder_tokenizer.vocab_size + 1)
+        prefix_inner_dim=prefix_dim,
+        # prefix_hidden_dim=prefix_dim,
+        vocab_size=decoder_tokenizer.vocab_size + add_vocab_size)
     pipe.text_decoder = text_decoder
 
     pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
@@ -119,45 +163,26 @@ def get_dataloader(data_config, val=False):
     
     return dataloader
 
-data_config = {
-    'type': 'FlexibleInternalData',
-    'roots': [
-        '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
-    ],
-    'json_lst': [
-        '/mnt/bn/us-aigc-temp/henry/test.json',
-    ],
-    'load_vae_feat': False,
-    'load_t5_feat': False,
-    'transform': 'default_train'
-}
-val_loader = get_dataloader(data_config, val=True)
+val_loader = get_dataloader(val_config, val=True)
 
 if not args.sample_and_exit:
-    data_config = {
-        'type': 'FlexibleInternalDataMS',
-        # 'type': 'FlexibleInternalData',
-        'roots': [
-            '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
-            # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
-        ],
-        'json_lst': [
-            '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
-            # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json'
-        ],
-        'load_vae_feat': False,
-        'load_t5_feat': False,
-        'transform': 'default_train'
-    }
-    dataloader = get_dataloader(data_config)
+    dataloader = get_dataloader(train_config)
 else:
     dataloader = val_loader
 
 num_epochs = 2
 
 models = [pipe.text_decoder]
+if args.clip:
+    ft_models = [pipe.clip_image_encoder]
+else:
+    ft_models = []
 
-optimizer = torch.optim.AdamW(lr=1e-4, params=pipe.parameters(models=models))
+if args.clip:
+    optimizer = torch.optim.AdamW(lr=5e-5, params=pipe.parameters(models=models))
+    optimizer.add_param_group(dict(params=pipe.parameters(models=ft_models), lr=1e-6))
+else:
+    optimizer = torch.optim.AdamW(lr=1e-4, params=pipe.parameters(models=models))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=500,
@@ -167,22 +192,33 @@ lr_scheduler = get_cosine_schedule_with_warmup(
 for p in pipe.parameters():
     p.requires_grad = False
 
-for p in pipe.parameters(models=models):
+for p in pipe.parameters(models=models + ft_models):
     p.requires_grad = True
 
 accelerator = Accelerator(
         mixed_precision='fp16',
     )
 
+def unwrap(pipe):
+    pipe.transformer = accelerator.unwrap_model(pipe.transformer)
+    pipe.text_encoder = accelerator.unwrap_model(pipe.text_encoder)
+    pipe.text_encoder_2 = accelerator.unwrap_model(pipe.text_encoder_2)
+    pipe.clip_image_encoder = accelerator.unwrap_model(pipe.clip_image_encoder)
+    pipe.text_decoder = accelerator.unwrap_model(pipe.text_decoder)
+    pipe.vae = accelerator.unwrap_model(pipe.vae)
+    pipe.image_encoder_adapter = accelerator.unwrap_model(pipe.image_encoder_adapter)
+    pipe.image_decoder_adapter = accelerator.unwrap_model(pipe.image_decoder_adapter)
+    return pipe
+
 def truncate(texts):
-    texts = pipe.tokenizer.batch_decode(pipe.tokenizer(
-        texts,
-        padding="max_length",
-        max_length=77 - 3,
-        truncation=True,
-        return_tensors="pt",
-    ).input_ids)
-    texts = [x.replace('<|endoftext|>', '').replace('<|startoftext|>', '') for x in texts]
+    # texts = pipe.tokenizer.batch_decode(pipe.tokenizer(
+    #     texts,
+    #     padding="max_length",
+    #     max_length=77 - 3,
+    #     truncation=True,
+    #     return_tensors="pt",
+    # ).input_ids)
+    # texts = [x.replace('<|endoftext|>', '').replace('<|startoftext|>', '') for x in texts]
 
     return texts
 
@@ -215,16 +251,33 @@ def get_lr(optimizer):
 
 print(f"TOTAL TRANSFORMER LAYERS: {len(pipe.transformer.transformer_blocks)} | OUR CHOSEN BLOCK: {args.block_num}")
 
+def get_suffix_ids(batch):
+    if args.dataset_conditioning:
+        idxs = batch[-1]['data_idx']
+        assert (idxs < len(train_config['roots'])).all()
+        suffix_text = [f'<|dataset{i}|>' for i in idxs]
+        suffix_ids = pipe.decoder_tokenizer(suffix_text, return_tensors='pt').input_ids.to(accelerator.device)
+        return suffix_ids
+    return None
+
 def sample(batch):
     with torch.no_grad():
-        if len(batch) > 1:
-            print("Sample batch is large! Is this really what we want? Truncating to 1.")
-        image = batch[0][:1].to('cuda')
+        if len(batch[0]) > 1:
+            print(f"Sample batch size is large ({len(batch[0])})! Is this really what we want?")
+        image = batch[0].to(accelerator.device)
         index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
-        embeds, pooled_embeds = pipe.dift_features(image, index, return_layers=args.block_num)
+        suffix_input_ids = get_suffix_ids(batch)
+        print('suffix_input_ids', suffix_input_ids)
+        if args.clip:
+            embeds, pooled_embeds = pipe.encode_image(image, dtype=torch.float16)
+        else:
+            embeds, pooled_embeds = pipe.dift_features(
+                image, index, return_layers=args.block_num, dataset_conditioning=args.dataset_conditioning)
         embeds = torch.cat([embeds, pooled_embeds], axis=1)
         decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
-                            eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
+                            eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device,
+                            suffix_input_ids=suffix_input_ids
+                            )[0]
         decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
     return decoded_text
 
@@ -252,17 +305,20 @@ else:
             optimizer.zero_grad()
             
             # prepare data
-            image, prompt = batch[0].to('cuda'), truncate(batch[1])
-            batch[1] = [x.strip('<|endoftext|>') for x in batch[1]]
+            image, prompt = batch[0].to(accelerator.device), truncate(batch[1])
+            batch[1] = [x.replace('<|endoftext|>', '') for x in batch[1]]
             index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
 
             # run model
-            embeds, pooled_embeds = pipe.dift_features(image, index, return_layers=args.block_num)
+            suffix_input_ids = get_suffix_ids(batch)
+            if args.clip:
+                embeds, pooled_embeds = pipe.encode_image(image, dtype=torch.float16)
+            else:
+                embeds, pooled_embeds = pipe.dift_features(image, index, return_layers=args.block_num, 
+                dataset_conditioning=args.dataset_conditioning)
 
-            loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+            loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt, suffix_input_ids=suffix_input_ids)
             accelerator.backward(loss)
-
-            # grad_norm = accelerator.clip_grad_norm_(pipe.parameters(), 0.01)
 
             for p in pipe.parameters():
                 if p.grad is not None:
@@ -275,12 +331,14 @@ else:
 
             if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
                 if (step + 1) % 10000 == 0:
+                    pipe = unwrap(pipe)
                     pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
                     print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
                 else:
                     pipe.save_pretrained(f'{args.work_dir}/current/')
 
-                decoded_text = sample(next(iter(dataloader)))
+                batch = next(iter(val_loader))
+                decoded_text = sample(batch)
                 print(
                     f"Recon: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} | "
                     f"True: {batch[1][0]}"

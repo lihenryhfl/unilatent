@@ -92,18 +92,6 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         self.prefix_inner_dim = prefix_inner_dim # in the future change this to input dim to be more clear
         self.prefix_hidden_dim = prefix_hidden_dim if prefix_hidden_dim is not None else prefix_inner_dim
 
-        # # note: prefix_len = embed_len + pooled_embed_len
-        # self.relength = ReLength((prefix_length - 1) * 2, prefix_inner_dim // 2, 16) # for embed
-        # self.pooled_relength = ReLength(2, prefix_inner_dim // 2, 16) # for pooled_embed
-
-        # # self.image_embedder = nn.Linear(prefix_inner_dim, prefix_inner_dim)
-        # # self.pooled_image_embedder = nn.Linear(prefix_inner_dim, prefix_inner_dim)
-
-        # # nn.init.constant_(self.image_embedder.weight, 0)
-        # # nn.init.constant_(self.image_embedder.bias, 0)
-        # # nn.init.constant_(self.pooled_image_embedder.weight, 0)
-        # # nn.init.constant_(self.pooled_image_embedder.bias, 0)
-
         if self.prefix_inner_dim != self.prefix_hidden_dim:
             self.encode_prefix = (
                 nn.Linear(self.prefix_inner_dim, self.prefix_hidden_dim) if self.prefix_inner_dim is not None else nn.Identity()
@@ -138,12 +126,21 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         )
         self.transformer = GPT2LMHeadModel(gpt_config)
 
+    def get_prefix_embeds(self, x, suffix_input_ids):
+        hidden = self.encode_prefix(x)
+        prefix_embeds = self.decode_prefix(hidden)
+        if suffix_input_ids is not None:
+            suffix_embeds = self.transformer.transformer.wte(suffix_input_ids)
+            prefix_embeds = torch.cat([prefix_embeds, suffix_embeds], axis=1)
+        return prefix_embeds
+
     def forward(
         self,
         input_ids: torch.Tensor,
-        prefix_embeds: torch.Tensor,
+        features: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        suffix_input_ids: Optional[torch.Tensor] = None
     ):
         """
         Args:
@@ -157,8 +154,7 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
                 Labels to use for language modeling.
         """
         embedding_text = self.transformer.transformer.wte(input_ids)
-        hidden = self.encode_prefix(prefix_embeds)
-        prefix_embeds = self.decode_prefix(hidden)
+        prefix_embeds = self.get_prefix_embeds(features, suffix_input_ids)
         embedding_cat = torch.cat((prefix_embeds, embedding_text), dim=1)
 
         if labels is None:
@@ -172,7 +168,7 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         return torch.zeros(batch_size, self.prefix_length, dtype=torch.int64, device=device)
 
     @torch.no_grad()
-    def generate_captions(self, features, eos_token_id, device):
+    def generate_captions(self, features, eos_token_id, device, suffix_input_ids=None):
         """
         Generate captions given text embedding features. Returns list[L].
 
@@ -191,10 +187,7 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         generated_tokens = []
         generated_seq_lengths = []
         for feature in features:
-            # prefix_embeds = self.decode_prefix(feature.to(device))  # back to the clip feature
-            hidden = self.encode_prefix(feature.to(device))
-            prefix_embeds = self.decode_prefix(hidden)
-            # print("WHOA INSIDE CAPTION DECODER", prefix_embeds.norm(), prefix_embeds.mean(), prefix_embeds.std())
+            prefix_embeds = self.get_prefix_embeds(feature.to(device), suffix_input_ids)
             # Only support beam search for now
             output_tokens, seq_lengths = self.generate_beam(
                 input_embeds=prefix_embeds, device=device, eos_token_id=eos_token_id

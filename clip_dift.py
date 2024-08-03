@@ -191,7 +191,7 @@ print(f"TOTAL TRANSFORMER LAYERS: {len(pipe.transformer.transformer_blocks)} | O
 
 def sample(batch):
     with torch.no_grad():
-        if len(batch) > 1:
+        if len(batch[0]) > 1:
             print("Sample batch is large! Is this really what we want? Truncating to 1.")
         image = batch[0][:1].to('cuda')
         index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
@@ -255,7 +255,8 @@ else:
                 else:
                     pipe.save_pretrained(f'{args.work_dir}/current/')
 
-                decoded_text = sample(next(iter(dataloader)))
+                batch = next(iter(dataloader))
+                decoded_text = sample(batch)
                 print(
                     f"Recon: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} | "
                     f"True: {batch[1][0]}"
