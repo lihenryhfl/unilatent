@@ -94,17 +94,19 @@ if not args.sample_and_exit:
         'type': 'FlexibleInternalDataMS',
         'roots': [
             # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
+            '/mnt/bn/us-aigc-temp/henry/coco_2014/train2014/',
             '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
-            # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
-            # '/mnt/bn/aigc-us/zjl/openimages/data/',
-            # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/'
+            '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
+            '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/',
+            '/mnt/bn/aigc-us/zjl/openimages/data/',
         ],
         'json_lst': [
             # '/mnt/bn/us-aigc-temp/henry/test.json',
+            '/mnt/bn/us-aigc-temp/henry/train.json',
             '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
-            # '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json',
-            # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json',
-            # '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json'
+            '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json',
+            '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json',
+            '/mnt/bn/aigc-us/zjl/openimages/data/meta_data.json',
         ],
         'load_vae_feat': False,
         'load_t5_feat': False
@@ -122,12 +124,15 @@ else:
 
 num_epochs = 2
 
-models = [pipe.text_decoder]
-models2 = []
+# models = [pipe.text_decoder]
+# models2 = []
 # models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
 # models = [pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2, pipe.image_encoder_adapter]
 # models = [pipe.text_decoder, pipe.image_encoder_adapter, pipe.image_decoder_adapter]
 # models2 = [pipe.text_encoder, pipe.text_encoder_2, pipe.clip_image_encoder]
+
+models = [pipe.image_encoder_adapter]
+models2 = [pipe.clip_image_encoder]
 
 
 optimizer = torch.optim.AdamW(lr=5e-5, params=pipe.parameters(models=models))
@@ -268,12 +273,12 @@ else:
             embeds = image_embeds
             pooled_embeds = pooled_image_embeds
 
-            # model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
-            # d_loss = torch.nan_to_num(((model_output - target) ** 2).mean())
-            d_loss = torch.tensor(0., dtype=torch.float16, device=accelerator.device)
-            # c_loss = torch.tensor(0., dtype=torch.float16, device=accelerator.device)
+            model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
+            d_loss = torch.nan_to_num(((model_output - target) ** 2).mean())
+            # d_loss = torch.tensor(0., dtype=torch.float16, device=accelerator.device)
+            c_loss = torch.tensor(0., dtype=torch.float16, device=accelerator.device)
 
-            c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+            # c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
             if not c_loss.isfinite().all():
                 print(f"c_loss has nan.")
             c_loss = torch.nan_to_num(c_loss)

@@ -99,7 +99,7 @@ else:
         prefix_length = int(args.image_size ** 2 / 16 ** 2)
 
     if args.clip:
-        prefix_length = 258
+        prefix_length = 259 if args.dataset_conditioning else 258
         prefix_dim = 1024
     else:
         prefix_dim = 1536 * len(args.block_num)
@@ -107,7 +107,6 @@ else:
     text_decoder = TextDecoder(
         prefix_length=prefix_length,
         prefix_inner_dim=prefix_dim,
-        # prefix_hidden_dim=prefix_dim,
         vocab_size=decoder_tokenizer.vocab_size + add_vocab_size)
     pipe.text_decoder = text_decoder
 
