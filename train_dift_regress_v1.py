@@ -37,6 +37,7 @@ parser.add_argument('--image_size', type=int, default=-1)
 parser.add_argument('--sample_and_exit', action='store_true')
 parser.add_argument('--dataset_conditioning', action='store_true')
 parser.add_argument('--clip', action='store_true')
+parser.add_argument('--v2', action='store_true')
 args = parser.parse_args()
 
 args.block_num = [args.block_num] if not isinstance(args.block_num, list) else args.block_num
@@ -71,8 +72,16 @@ train_config = {
 }
 
 if args.dataset_conditioning:
-    train_config['roots'].append('/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/')
-    train_config['json_lst'].append('/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json')
+    train_config['roots'].extend([
+        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
+        '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/',
+        '/mnt/bn/aigc-us/zjl/openimages/data/',
+    ])
+    train_config['json_lst'].extend([
+        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json',
+        '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json',
+        '/mnt/bn/aigc-us/zjl/openimages/data/meta_data.json',
+    ])
 
 if args.load_from:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
@@ -101,6 +110,8 @@ else:
     if args.clip:
         prefix_length = 259 if args.dataset_conditioning else 258
         prefix_dim = 1024
+    elif args.v2:
+        prefix_dim = 1536
     else:
         prefix_dim = 1536 * len(args.block_num)
 
@@ -117,9 +128,13 @@ else:
     transformer.load_state_dict(pipe.transformer.state_dict())
     pipe.transformer = transformer
 
-    # image_encoder_adapter = EmbedAdapter(input_dim=1536, output_dim=1536, output_length=511, n_heads=16)
-    image_encoder_adapter = None
-
+    if args.v2:
+        image_encoder_adapter = EmbedAdapter(
+            input_dim=1536 * len(args.block_num), output_dim=1536, output_length=prefix_length - 1, n_heads=16)
+        soft_prompter = SoftPrompter(2048, length=1)
+    else:
+        soft_prompter = image_encoder_adapter = None
+        
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
         scheduler=pipe.scheduler,
@@ -133,6 +148,7 @@ else:
         text_decoder=pipe.text_decoder,
         decoder_tokenizer=pipe.decoder_tokenizer,
         image_encoder_adapter=image_encoder_adapter,
+        soft_prompter=soft_prompter
     )
 
 def get_dataloader(data_config, val=False):
@@ -169,19 +185,22 @@ if not args.sample_and_exit:
 else:
     dataloader = val_loader
 
-num_epochs = 2
+num_epochs = 1
 
 models = [pipe.text_decoder]
-if args.clip:
-    ft_models = [pipe.clip_image_encoder]
-else:
-    ft_models = []
+ft_models = []
+
+if args.v2:
+    models.extend([pipe.image_encoder_adapter, pipe.soft_prompter])
 
 if args.clip:
-    optimizer = torch.optim.AdamW(lr=5e-5, params=pipe.parameters(models=models))
+    ft_models.append(pipe.clip_image_encoder)
+
+optimizer = torch.optim.AdamW(lr=1e-5, params=pipe.parameters(models=models))
+
+if ft_models:
     optimizer.add_param_group(dict(params=pipe.parameters(models=ft_models), lr=1e-6))
-else:
-    optimizer = torch.optim.AdamW(lr=1e-4, params=pipe.parameters(models=models))
+
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=500,
@@ -207,6 +226,7 @@ def unwrap(pipe):
     pipe.vae = accelerator.unwrap_model(pipe.vae)
     pipe.image_encoder_adapter = accelerator.unwrap_model(pipe.image_encoder_adapter)
     pipe.image_decoder_adapter = accelerator.unwrap_model(pipe.image_decoder_adapter)
+    pipe.soft_prompter = accelerator.unwrap_model(pipe.soft_prompter)
     return pipe
 
 def truncate(texts):
@@ -232,6 +252,7 @@ pipe = pipe.to(accelerator.device)
     pipe.text_decoder,
     pipe.vae,
     pipe.image_encoder_adapter,
+    pipe.soft_prompter,
 ) = accelerator.prepare(
     optimizer, 
     lr_scheduler,
@@ -242,6 +263,7 @@ pipe = pipe.to(accelerator.device)
     pipe.text_decoder,
     pipe.vae,
     pipe.image_encoder_adapter,
+    pipe.soft_prompter,
 )
 
 def get_lr(optimizer):
@@ -255,7 +277,7 @@ def get_suffix_ids(batch):
         idxs = batch[-1]['data_idx']
         assert (idxs < len(train_config['roots'])).all()
         suffix_text = [f'<|dataset{i}|>' for i in idxs]
-        suffix_ids = pipe.decoder_tokenizer(suffix_text, return_tensors='pt').input_ids.to(accelerator.device)
+        suffix_ids = pipe.decoder_tokenizer(suffix_text, return_tensors='pt', max_length=1).input_ids.to(accelerator.device)
         return suffix_ids
     return None
 
@@ -298,6 +320,7 @@ if args.sample_and_exit:
             with open(save_path, 'w') as f:
                 json.dump(json_list, f)
 else:
+    losses = []
     for epoch in range(num_epochs):
         progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
         for step, batch in enumerate(progbar):
@@ -326,7 +349,9 @@ else:
             optimizer.step()
             lr_scheduler.step()
             
-            progbar.set_description(f"loss: {loss.item():.3f}, lr: {get_lr(optimizer)}")
+            losses.append(accelerator.gather(loss).detach().cpu())
+            assert losses
+            progbar.set_description(f"loss: {torch.stack(losses).mean().item():.3f}, lr: {get_lr(optimizer)}")
 
             if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
                 if (step + 1) % 10000 == 0:

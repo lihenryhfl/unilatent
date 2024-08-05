@@ -134,7 +134,6 @@ num_epochs = 2
 models = [pipe.image_encoder_adapter]
 models2 = [pipe.clip_image_encoder]
 
-
 optimizer = torch.optim.AdamW(lr=5e-5, params=pipe.parameters(models=models))
 optimizer.add_param_group(dict(params=pipe.parameters(models=models2), lr=1e-6))
 lr_scheduler = get_cosine_schedule_with_warmup(

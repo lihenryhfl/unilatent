@@ -1150,7 +1150,6 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         if self._hasattr('soft_prompter'):
             embed, pooled_embed = self.soft_prompter(embed, pooled_embed)
-            assert False
         
         hidden_list = []
         for i in range(num_aggregation_steps):
@@ -1170,7 +1169,11 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             prefix_length = prefix_length - 1
 
         assert hidden.shape[1] >= prefix_length, f"{hidden.shape, self.text_decoder.prefix_length}"
-        hidden = hidden[:, :prefix_length]
+        if self._hasattr('image_encoder_adapter'):
+            hidden = self.image_encoder_adapter(hidden)
+        else:
+            hidden = hidden[:, :prefix_length]
+        
         # basic conversion to work with our framework
         return hidden[:, :-1], hidden[:, -1:]
 

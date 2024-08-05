@@ -89,25 +89,30 @@ class Adapter(nn.Module):
         
 class EmbedAdapter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
     @register_to_config
-    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16):
+    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16, embed_pool=False):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.output_length = output_length
         self.redimension = ReDimension(input_dim, output_dim)
-        self.pooled_redimension = ReDimension(input_dim, output_dim)
+        self.embed_pool = embed_pool
+        if embed_pool:
+            self.pooled_redimension = ReDimension(input_dim, output_dim)
 
         if output_length > -1:
             self.relength = ReLength(output_length, output_dim, n_heads)
 
-    def forward(self, x, x_pooled):
+    def forward(self, x, x_pooled=None):
         x = self.redimension(x)
-        x_pooled = self.pooled_redimension(x_pooled)
 
         if hasattr(self, 'relength'):
             x = self.relength(x)
 
-        return x, x_pooled
+        if self.embed_pool:
+            x_pooled = self.pooled_redimension(x_pooled)
+            return x, x_pooled
+
+        return x
         
 
 class AdapterConfig(PretrainedConfig):
