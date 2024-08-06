@@ -34,8 +34,10 @@ parser.add_argument('--index', type=int, default=750)
 
 parser.add_argument('--block_num', nargs='+', type=int, default='12')
 parser.add_argument('--image_size', type=int, default=-1)
+parser.add_argument('--step_offset', type=int, default=0)
 parser.add_argument('--sample_and_exit', action='store_true')
 parser.add_argument('--dataset_conditioning', action='store_true')
+parser.add_argument('--coco_train_only', action='store_true')
 parser.add_argument('--clip', action='store_true')
 parser.add_argument('--v2', action='store_true')
 args = parser.parse_args()
@@ -72,6 +74,7 @@ train_config = {
 }
 
 if args.dataset_conditioning:
+    assert not args.coco_train_only
     train_config['roots'].extend([
         '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
         '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/',
@@ -82,6 +85,10 @@ if args.dataset_conditioning:
         '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json',
         '/mnt/bn/aigc-us/zjl/openimages/data/meta_data.json',
     ])
+elif args.coco_train_only:
+    del train_config['roots'][-1]
+    del train_config['json_lst'][-1]
+    print(train_config)
 
 if args.load_from:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
@@ -185,7 +192,10 @@ if not args.sample_and_exit:
 else:
     dataloader = val_loader
 
-num_epochs = 1
+if args.coco_train_only:
+    num_epochs = 45
+else:
+    num_epochs = 1
 
 models = [pipe.text_decoder]
 ft_models = []
@@ -196,14 +206,15 @@ if args.v2:
 if args.clip:
     ft_models.append(pipe.clip_image_encoder)
 
-optimizer = torch.optim.AdamW(lr=1e-5, params=pipe.parameters(models=models))
+# optimizer = torch.optim.AdamW(lr=1e-5, params=pipe.parameters(models=models))
+optimizer = torch.optim.AdamW(lr=5e-6, params=pipe.parameters(models=models))
 
 if ft_models:
     optimizer.add_param_group(dict(params=pipe.parameters(models=ft_models), lr=1e-6))
 
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=500,
+            num_warmup_steps=1000,
             num_training_steps=(len(dataloader) * num_epochs),
         )
 
@@ -288,7 +299,6 @@ def sample(batch):
         image = batch[0].to(accelerator.device)
         index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
         suffix_input_ids = get_suffix_ids(batch)
-        print('suffix_input_ids', suffix_input_ids)
         if args.clip:
             embeds, pooled_embeds = pipe.encode_image(image, dtype=torch.float16)
         else:
@@ -301,6 +311,8 @@ def sample(batch):
                             )[0]
         decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
     return decoded_text
+
+iter_val_loader = iter(val_loader)
 
 if args.sample_and_exit:
     save_path = os.path.join(args.work_dir, 'captions.json')
@@ -321,9 +333,10 @@ if args.sample_and_exit:
                 json.dump(json_list, f)
 else:
     losses = []
+    step = args.step_offset
     for epoch in range(num_epochs):
         progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
-        for step, batch in enumerate(progbar):
+        for batch in progbar:
             optimizer.zero_grad()
             
             # prepare data
@@ -353,18 +366,22 @@ else:
             assert losses
             progbar.set_description(f"loss: {torch.stack(losses).mean().item():.3f}, lr: {get_lr(optimizer)}")
 
-            if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
-                if (step + 1) % 10000 == 0:
+            if accelerator.is_main_process and (step + 1) % 500 == 0:
+                if (step + 1) % 5000 == 0:
                     pipe = unwrap(pipe)
-                    pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
-                    print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
-                else:
+                    pipe.save_pretrained(f'{args.work_dir}/step_{step}/')
+                    print(f"Saved model to directory {f'{args.work_dir}/step_{step}/'}")
+                elif (step + 1) % 1000 == 0:
                     pipe.save_pretrained(f'{args.work_dir}/current/')
 
-                batch = next(iter(val_loader))
+                batch = next(iter_val_loader)
                 decoded_text = sample(batch)
                 print(
                     f"Recon: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} | "
                     f"True: {batch[1][0]}"
                 )
+
+                losses = []
+            
+            step += 1
     

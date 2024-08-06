@@ -62,6 +62,7 @@ class FlexibleInternalData(InternalDataSigma):
         self.mask_index_samples = []
         self.ratio_index = {}
         self.ratio_nums = {}
+        self.data_source = []
 
         self.weight_dtype = torch.float16 if self.real_prompt_ratio > 0 else torch.float32
         self.interpolate_model = InterpolationMode.BICUBIC
@@ -74,11 +75,12 @@ class FlexibleInternalData(InternalDataSigma):
         if not json_lst:
             json_lst = [os.path.join(root, 'meta_data.json') for root in roots]
 
-        for root, json_file in zip(roots, json_lst):
+        for i, (root, json_file) in enumerate(zip(roots, json_lst)):
 
             meta_data = self.load_json(os.path.join(root, json_file))
             self.ori_imgs_nums += len(meta_data)
             meta_data_clean = [item for item in meta_data if item['ratio'] <= 4.5]
+            self.data_source.extend([(i, json_file)] * len(meta_data_clean))
             self.meta_data_clean.extend(meta_data_clean)
             self.img_samples.extend([
                 os.path.join(root, item['image_path']) for item in meta_data_clean
@@ -99,7 +101,8 @@ class FlexibleInternalData(InternalDataSigma):
 
     def getdata(self, index):
         img, txt_fea, attention_mask, data_info = super().getdata(index)
-        if 'image_id' in self.meta_data_clean[index]:
+        if self.return_image_id:
+            # 'image_id' in self.meta_data_clean[index]:
             data_info['image_id'] = self.meta_data_clean[index]['image_id']
 
         return img, txt_fea, attention_mask, data_info

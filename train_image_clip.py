@@ -50,6 +50,8 @@ if not args.load_from:
     transformer.load_state_dict(pipe.transformer.state_dict())
     pipe.transformer = transformer
 
+    image_encoder_adapter = EmbedAdapter(1024, 2048, 77, embed_pool=True)
+
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
         scheduler=pipe.scheduler,
@@ -62,12 +64,12 @@ if not args.load_from:
         clip_image_processor=pipe.clip_image_processor,
         text_decoder=pipe.text_decoder,
         decoder_tokenizer=pipe.decoder_tokenizer,
-        image_encoder_adapter=EmbedAdapter(1024, 2048, 77)
+        image_encoder_adapter=image_encoder_adapter
     )
 else:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 
-pipe.register_modules(image_decoder_adapter=EmbedAdapter(2048, 2048, 77))
+# pipe.register_modules(image_decoder_adapter=EmbedAdapter(2048, 2048, 77))
 
 val_data_config = {
     'type': 'FlexibleInternalDataMS',
@@ -129,7 +131,10 @@ num_epochs = 2
 # models = [pipe.transformer, pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2]
 # models = [pipe.text_decoder, pipe.clip_image_encoder, pipe.text_encoder, pipe.text_encoder_2, pipe.image_encoder_adapter]
 # models = [pipe.text_decoder, pipe.image_encoder_adapter, pipe.image_decoder_adapter]
-models2 = [pipe.text_encoder, pipe.text_encoder_2, pipe.clip_image_encoder]
+# models2 = [pipe.text_encoder, pipe.text_encoder_2, pipe.clip_image_encoder]
+
+models = [pipe.image_encoder_adapter]
+models2 = [pipe.clip_image_encoder]
 
 optimizer = torch.optim.AdamW(lr=5e-5, params=pipe.parameters(models=models))
 optimizer.add_param_group(dict(params=pipe.parameters(models=models2), lr=1e-6))
@@ -252,11 +257,11 @@ if args.sample_and_exit:
             with open(save_path, 'w') as f:
                 json.dump(json_list, f)
 else:
+    step = args.step_offset
     for epoch in range(num_epochs):
         # progbar = tqdm(dataloader, mininterval=30, disable=not accelerator.is_main_process)
         progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
-        for step, batch in enumerate(progbar):
-            step = args.step_offset + step
+        for batch in progbar:
             optimizer.zero_grad()
             
             # prepare data
@@ -297,23 +302,15 @@ else:
             
             progbar.set_description(f"LOSSES: diff {np.mean(d_losses).item():02.3f} | ce {np.mean(c_losses).item():02.3f}")
 
-            if accelerator.is_main_process and ((step + 1) % 500 == 0 or step == 10):
-                if (step + 1) % 500 == 0 or step == 10:
+            if accelerator.is_main_process and (step + 1) % 500 == 0:
+                if (step + 1) % 5000 == 0:
                     pipe = unwrap(pipe)
+                    pipe.save_pretrained(f'{args.work_dir}/step_{step}/')
+                    print(f"Saved model to directory {f'{args.work_dir}/step_{step}/'}")
+                elif (step + 1) % 1000 == 0:
                     pipe.save_pretrained(f'{args.work_dir}/current/')
-                    print(f"Saved model to directory {f'{args.work_dir}/current/'}")
-                elif (step + 1) % 5000 == 0 or step == 10:
-                    pipe = unwrap(pipe)
-                    pipe.save_pretrained(f'{args.work_dir}/epoch_{epoch}_step_{step}/')
-                    print(f"Saved model to directory {f'{args.work_dir}/epoch_{epoch}_step_{step}/'}")
 
                 d_losses = []
                 c_losses = []
-
-                batch = next(iter_val_loader)
-                decoded_text = sample(batch)
-                print(
-                    f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
-                    f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
-                    f"True: {batch[1][0]}"
-                )
+            
+            step += 1

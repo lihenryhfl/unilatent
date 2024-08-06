@@ -40,7 +40,7 @@ class InternalData(Dataset):
         self.N = int(resolution // (input_size // patch_size))
         self.mask_ratio = mask_ratio
         self.load_mask_index = load_mask_index
-        self.max_lenth = max_length
+        self.max_length = max_length
         self.meta_data_clean = []
         self.img_samples = []
         self.txt_feat_samples = []
@@ -97,9 +97,9 @@ class InternalData(Dataset):
         attention_mask = torch.ones(1, 1, txt_fea.shape[1])     # 1x1xT
         if 'attention_mask' in txt_info.keys():
             attention_mask = torch.from_numpy(txt_info['attention_mask'])[None]
-        if txt_fea.shape[1] != self.max_lenth:
-            txt_fea = torch.cat([txt_fea, txt_fea[:, -1:].repeat(1, self.max_lenth-txt_fea.shape[1], 1)], dim=1)
-            attention_mask = torch.cat([attention_mask, torch.zeros(1, 1, self.max_lenth-attention_mask.shape[-1])], dim=-1)
+        if txt_fea.shape[1] != self.max_length:
+            txt_fea = torch.cat([txt_fea, txt_fea[:, -1:].repeat(1, self.max_length-txt_fea.shape[1], 1)], dim=1)
+            attention_mask = torch.cat([attention_mask, torch.zeros(1, 1, self.max_length-attention_mask.shape[-1])], dim=-1)
 
         if self.transform:
             img = self.transform(img)
@@ -184,7 +184,7 @@ class InternalDataSigma(Dataset):
         self.load_mask_index = load_mask_index
         self.mask_type = mask_type
         self.real_prompt_ratio = real_prompt_ratio
-        self.max_lenth = max_length
+        self.max_length = max_length
         self.meta_data_clean = []
         self.img_samples = []
         self.txt_samples = []
@@ -253,22 +253,25 @@ class InternalDataSigma(Dataset):
         else:
             img = self.loader(img_path)
 
-        attention_mask = torch.ones(1, 1, self.max_lenth)     # 1x1xT
+        attention_mask = torch.ones(1, 1, self.max_length)     # 1x1xT
         if self.load_t5_feat:
             txt_info = np.load(npz_path)
             txt_fea = torch.from_numpy(txt_info['caption_feature'])     # 1xTx4096
             if 'attention_mask' in txt_info.keys():
                 attention_mask = torch.from_numpy(txt_info['attention_mask'])[None]
-            if txt_fea.shape[1] != self.max_lenth:
-                txt_fea = torch.cat([txt_fea, txt_fea[:, -1:].repeat(1, self.max_lenth-txt_fea.shape[1], 1)], dim=1)
-                attention_mask = torch.cat([attention_mask, torch.zeros(1, 1, self.max_lenth-attention_mask.shape[-1])], dim=-1)
+            if txt_fea.shape[1] != self.max_length:
+                txt_fea = torch.cat([txt_fea, txt_fea[:, -1:].repeat(1, self.max_length-txt_fea.shape[1], 1)], dim=1)
+                attention_mask = torch.cat([attention_mask, torch.zeros(1, 1, self.max_length-attention_mask.shape[-1])], dim=-1)
         else:
             txt_fea = txt
 
         if self.transform:
             img = self.transform(img)
 
+        data_source = self.data_source[index]
         data_info["mask_type"] = self.mask_type
+        data_info['data_idx'] = data_source[0]
+        data_info['data_json'] = data_source[1]
         return img, txt_fea, attention_mask.to(torch.int16), data_info
 
     def __getitem__(self, idx):
