@@ -42,7 +42,7 @@ print("BLOCK NUM", args.block_num)
 if args.load_from:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 else:
-    pipe = UniLatentPipeline.from_pretrained('/mnt/bn/us-aigc-temp/henry/data/unilatent/train_all_2_8gpu/current/', torch_dtype=torch.float32)
+    pipe = UniLatentPipeline.from_pretrained('/mnt/bn/us-aigc-temp/henry/data/unilatent/train_clip_sd3_2/current/', torch_dtype=torch.float32)
 
     decoder_tokenizer = GPT2Tokenizer.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt_tokenizer/')
     decoder_tokenizer.add_special_tokens({'pad_token': decoder_tokenizer.eos_token})

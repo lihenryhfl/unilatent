@@ -165,6 +165,7 @@ def get_dataloader(data_config, val=False):
         resolution = args.image_size
         aspect_ratio_type = f'ASPECT_RATIO_{args.image_size}' if args.image_size in [256, 512] else 'ASPECT_RATIO_512'
         data_config['type'] = 'FlexibleInternalData'
+        kwargs['return_image_id'] = val
     else:
         resolution = 512
         aspect_ratio_type = 'ASPECT_RATIO_512'
