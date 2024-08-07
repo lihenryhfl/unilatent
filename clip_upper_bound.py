@@ -276,7 +276,7 @@ else:
 
             # run model
             suffix_input_ids = get_suffix_ids(batch)
-            image_embeds, pooled_image_embeds = pipe.encode_image(image, dtype=torch.float16)
+            image_embeds, pooled_image_embeds = pipe.encode_text(image)
 
             # run model
             embeds, pooled_embeds = pipe.dift_features(

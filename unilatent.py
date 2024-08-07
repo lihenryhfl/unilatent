@@ -1066,7 +1066,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         joint_embed = torch.cat([embed, pooled_embed.reshape(B, 1, C)], axis=1)
 
         processed_prompt = [self.decoder_tokenizer.bos_token + txt + self.decoder_tokenizer.eos_token for txt in prompt]
-        tokens = self.decoder_tokenizer(processed_prompt, return_tensors='pt', truncation=True, 
+        tokens = self.decoder_tokenizer(processed_prompt, return_tensors='pt', truncation=True,
                                      max_length=120, padding="longest")
         mask = pad_mask(tokens['attention_mask'], prefix_len=self.text_decoder.prefix_length).to(self.device)
         input_ids = tokens['input_ids'].to(self.device)
@@ -1141,7 +1141,9 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
 ######################## FOR DIFT #########################
     def dift_features(self, image, index, embed=None, pooled_embed=None, 
-        return_layers=12, num_aggregation_steps=1, dataset_conditioning=False):
+        return_layers=12, num_aggregation_steps=1, dataset_conditioning=False,
+        skip_adapter=False
+        ):
         if not (isinstance(return_layers, list) or isinstance(return_layers, tuple)):
             return_layers = [return_layers]
         
@@ -1169,7 +1171,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             prefix_length = prefix_length - 1
 
         assert hidden.shape[1] >= prefix_length, f"{hidden.shape, self.text_decoder.prefix_length}"
-        if self._hasattr('image_encoder_adapter'):
+        if self._hasattr('image_encoder_adapter') and not skip_adapter:
             hidden = self.image_encoder_adapter(hidden)
         else:
             hidden = hidden[:, :prefix_length]
