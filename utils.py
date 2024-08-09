@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import xformers.ops
 
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from transformers.modeling_utils import ModuleUtilsMixin
 from transformers.configuration_utils import PretrainedConfig
 
@@ -16,6 +18,56 @@ def pad_mask(orig_mask, prefix_len=77):
 def pad_ids(input_ids, prefix_len=77):
     extra_zeros = torch.zeros(len(input_ids), prefix_len, dtype=torch.int64, device=input_ids.device)
     return torch.cat([extra_zeros, input_ids], axis=1)
+
+def get_lr(optimizer):
+    for param_group in optimizer.param_groups:
+        return param_group['lr']
+
+class FrozenDecoderTrainableDataTokenWrapper:
+    def __init__(self, decoder, tokenizer, dtype=torch.float32):
+        self.decoder = decoder
+        self.tokenizer = tokenizer
+
+        weight = self.decoder.transformer.transformer.wte.weight
+        
+        mask = torch.zeros(size=weight.shape, dtype=dtype)
+        for token, token_id in tokenizer.get_added_vocab().items():
+            mask[token_id, :] = 1.
+        self.gradient_mask = mask
+
+        for n, p in self.decoder.named_parameters():
+            if 'wte' not in n:
+                p.requires_grad = False
+                print(f"Not training {n}.")
+            else:
+                p.requires_grad = True
+                print(f"Training {n}.")
+
+    def __getattr__(self, name):
+        """
+        Deals with issues accessing the model when it is wrapped by a DDP class.
+        """
+        print(name)
+        obj = self.__getattribute__(name)
+        if isinstance(obj, DDP):
+            obj = obj.module
+
+        return obj
+
+    def forward(self, *args, **kwargs):
+        return self.decoder(*args, **kwargs)
+
+    def fix_gradients(self):
+        with torch.no_grad():
+            for n, p in self.decoder.named_parameters():
+                if 'wte' not in n:
+                    assert not p.requires_grad
+                else:
+                    if p.grad is not None:
+                        p.grad *= self.gradient_mask
+                    else:
+                        print(f"In FrozenDecoderTrainableDataTokenWrapper: {n} has no gradient!")
+
 
 class MultiHeadCrossAttention(nn.Module):
     def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0.,
@@ -59,6 +111,77 @@ class MultiHeadCrossAttention(nn.Module):
         x = x.view(input_shape[0], -1, input_shape[-1])
         x = self.proj(x)
         x = self.proj_drop(x)
+
+        return x
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+
+        self.qkv_linear = nn.Linear(d_model, d_model*3)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(d_model, d_model)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = input_shape = x.shape
+
+        qkv = self.qkv_linear(x).view(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(2)
+
+        # aggregate queries into one
+        # q = q.mean(axis=N)
+
+        x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p)
+        x = x.view(input_shape[0], -1, input_shape[-1])
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+# class AttentionLayerAggregator(ModelMixin, ConfigMixin, ModuleUtilsMixin):
+#     @register_to_config
+#     def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16, embed_pool=False):
+#         super().__init__()
+        
+
+#     def forward(self, layers):
+#         x = torch.stack(layers, axis=2)
+#         B, N, L, C = x.shape # batch_size, n_positions, num_layers, n_channels
+#         print(f"SHAPES: {B}, {N}, {L}. {C}")
+        
+#         # combine the batch and position dimensions
+#         x = x.view(B * N, L, C)
+
+#         x = self.attn(x)
+
+#         # uncombine
+#         x = x.reshape(B, N, C)
+
+#         return x
+
+class LayerAggregator(ModelMixin, ConfigMixin, ModuleUtilsMixin):
+    @register_to_config
+    def __init__(self, n_layers):
+        super().__init__()
+        self.n_layers = n_layers
+        self.register_buffer("layer_logits", torch.zeros(n_layers))
+        self.softmax = nn.Softmax(dim=0)
+
+    def forward(self, layers):
+        B, N, C_prime = layers.shape
+        assert C_prime % self.n_layers == 0
+        C = C_prime // self.n_layers
+        # split on channel dimension to regain layers
+        layers = layers.reshape(B, N, self.n_layers, C)
+        layer_gates = self.softmax(self.layer_logits).reshape(self.n_layers, 1)
+        x = layers * layer_gates
+        x = x.sum(axis=-2)
 
         return x
 
@@ -134,26 +257,44 @@ class Adapter(nn.Module):
         
 class EmbedAdapter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
     @register_to_config
-    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16, embed_pool=False):
+    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16, redimension=True,
+                 use_attn=False, embed_pool=False, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.output_length = output_length
-        self.redimension = ReDimension(input_dim, output_dim)
-        self.embed_pool = embed_pool
-        if embed_pool:
-            self.pooled_redimension = ReDimension(input_dim, output_dim)
+        self.redimension = redimension
+        if self.redimension:
+            self.redimension = ReDimension(input_dim, output_dim)
+            self.embed_pool = embed_pool
+            if embed_pool:
+                self.pooled_redimension = ReDimension(input_dim, output_dim)
+
+        if use_attn:
+            self.attn = MultiHeadSelfAttention(input_dim, n_heads, attn_drop=attn_drop, proj_drop=proj_drop)
 
         if output_length > -1:
             self.relength = ReLength(output_length, output_dim, n_heads)
 
+        nn.init.constant_(self.attn.proj.weight, 0)
+        nn.init.constant_(self.attn.proj.bias, 0)
+
     def forward(self, x, x_pooled=None):
-        x = self.redimension(x)
+        if hasattr(self, 'attn'):
+            if self.embed_pool:
+                x_combined = torch.cat([x, x_pooled], axis=1)
+                x_combined = x_combined + self.attn(x_combined)
+                x, x_pooled = x_combined[:, :-1], x_combined[:, -1:]
+            else:
+                x = x + self.attn(x)
+        
+        if self.redimension:
+            x = self.redimension(x)
 
         if hasattr(self, 'relength'):
             x = self.relength(x)
 
-        if self.embed_pool:
+        if self.redimension and self.embed_pool:
             x_pooled = self.pooled_redimension(x_pooled)
             return x, x_pooled
 

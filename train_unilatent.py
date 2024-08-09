@@ -31,7 +31,6 @@ parser.add_argument('--load_from', default='', help='the dir to load from')
 parser.add_argument('--batch_size', type=int, default=48)
 parser.add_argument('--step_offset', type=int, default=0)
 parser.add_argument('--sample_and_exit', action='store_true')
-parser.add_argument('--text', action='store_true')
 args = parser.parse_args()
 
 if not args.load_from:
@@ -52,6 +51,7 @@ if not args.load_from:
     pipe.transformer = transformer
 
     image_encoder_adapter = EmbedAdapter(1024, 2048, 77, embed_pool=True, use_attn=True)
+    image_decoder_adapter = EmbedAdapter(2048, 2048, 77, embed_pool=True, use_attn=True)
 
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
@@ -65,12 +65,11 @@ if not args.load_from:
         clip_image_processor=pipe.clip_image_processor,
         text_decoder=pipe.text_decoder,
         decoder_tokenizer=pipe.decoder_tokenizer,
-        image_encoder_adapter=image_encoder_adapter
+        image_encoder_adapter=image_encoder_adapter,
+        image_decoder_adapter=image_decoder_adapter
     )
 else:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
-
-# pipe.register_modules(image_decoder_adapter=EmbedAdapter(2048, 2048, 77))
 
 val_data_config = {
     'type': 'FlexibleInternalDataMS',
@@ -125,24 +124,15 @@ if not args.sample_and_exit:
 else:
     dataloader = val_loader
 
-num_steps = 100_000
+num_steps = 200_000
 
-# models = [pipe.text_decoder]
-# models = [pipe.text_encoder, pipe.text_encoder_2]
-if args.text:
-    models = [pipe.transformer]
-    models2 = []
-elif args.text_and_image:
-    models = [pipe.image_encoder_adapter, pipe.text_decoder]
-    models2 = [pipe.clip_image_encoder, pipe.clip_image_decoder]
-else:
-    models = [pipe.image_encoder_adapter]
-    models2 = [pipe.clip_image_encoder]
+models = [pipe.text_decoder, pipe.image_encoder_adapter, pipe.image_decoder_adapter]
+models2 = [pipe.text_encoder, pipe.text_encoder_2, pipe.clip_image_encoder]
 
 [x.train for x in models]
 [x.train for x in models2]
 
-optimizer = torch.optim.AdamW(lr=2e-5, params=pipe.parameters(models=models))
+optimizer = torch.optim.AdamW(lr=1e-5, params=pipe.parameters(models=models))
 optimizer.add_param_group(dict(params=pipe.parameters(models=models2), lr=1e-6))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
@@ -160,6 +150,27 @@ accelerator = Accelerator(
         mixed_precision='fp16',
         # gradient_accumulation_steps=config.gradient_accumulation_steps
     )
+
+def truncate(texts):
+    texts = pipe.tokenizer.batch_decode(pipe.tokenizer(
+        texts,
+        padding="max_length",
+        max_length=77,
+        truncation=True,
+        return_tensors="pt",
+    ).input_ids)
+    texts = [x.replace('<|endoftext|>', '').replace('<|startoftext|>', '').strip().strip('!').strip() for x in texts]
+
+    texts = pipe.tokenizer_2.batch_decode(pipe.tokenizer_2(
+        texts,
+        padding="max_length",
+        max_length=77,
+        truncation=True,
+        return_tensors="pt",
+    ).input_ids)
+    texts = [x.replace('<|endoftext|>', '').replace('<|startoftext|>', '').strip().strip('!').strip() for x in texts]
+
+    return texts
 
 optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
 
@@ -253,19 +264,17 @@ else:
             optimizer.zero_grad()
             
             # prepare data
-            image, prompt = batch[0].to('cuda'), batch[1]
-            index = torch.randint(0, 1000, size=(len(image),))
-            # index = torch.randint(500, 1000, size=(len(image),))
+            image, prompt = batch[0].to('cuda'), truncate(batch[1])
+            # index = torch.randint(0, 1000, size=(len(image) * 2,))
 
             # run model
-            if args.text:
-                image_embeds, pooled_image_embeds = pipe.encode_text(prompt)
-            else:
-                image_embeds, pooled_image_embeds = pipe.encode_image(image, dtype=torch.float16)
-            
+            prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt)
+            image_embeds, pooled_image_embeds = pipe.encode_image(image, dtype=torch.float16)
 
-            embeds = image_embeds
-            pooled_embeds = pooled_image_embeds
+            embeds = torch.cat([prompt_embeds, image_embeds], axis=0)
+            pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds], axis=0)
+            image = torch.cat([image, image], axis=0)
+            prompt = prompt + prompt
 
             # model_output, target = pipe.embed_to_denoiser(image, embeds, pooled_embeds, index)
             model_output, target = pipe.embed_to_denoiser_v2(image, embeds, pooled_embeds)
@@ -273,9 +282,8 @@ else:
             if not d_loss.isfinite().all():
                 print(f"d_loss has nan.")
             d_loss = torch.nan_to_num(d_loss)
-            c_loss = torch.tensor(0., dtype=torch.float16, device=accelerator.device)
-
-            # c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+            c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+            
             if not c_loss.isfinite().all():
                 print(f"c_loss has nan.")
             c_loss = torch.nan_to_num(c_loss)
@@ -314,5 +322,13 @@ else:
 
                 d_losses = []
                 c_losses = []
+
+                batch = next(iter_val_loader)
+                decoded_text = sample(batch)
+                print(
+                    f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+                    f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+                    f"True: {batch[1][0]}"
+                )
             
             step += 1

@@ -28,7 +28,7 @@ from transformers import (
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from caption_decoder_v1 import TextDecoder
-from utils import pad_mask, EmbedAdapter, SoftPrompter
+from utils import pad_mask, EmbedAdapter, SoftPrompter, LayerAggregator
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin
@@ -179,7 +179,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->text_decoder->clip_image_encoder->transformer->vae"
-    _optional_components = ['image_decoder_adapter', 'image_encoder_adapter', 'soft_prompter']
+    _optional_components = ['image_decoder_adapter', 'image_encoder_adapter', 'soft_prompter', 'layer_aggregator']
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
 
     def __getattribute__(self, name):
@@ -208,6 +208,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         image_decoder_adapter: EmbedAdapter = None,
         image_encoder_adapter: EmbedAdapter = None,
         soft_prompter: SoftPrompter = None,
+        layer_aggregator: LayerAggregator = None,
     ):
         super().__init__()
         
@@ -232,6 +233,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             image_decoder_adapter=image_decoder_adapter,
             image_encoder_adapter=image_encoder_adapter,
             soft_prompter=soft_prompter,
+            layer_aggregator=layer_aggregator,
         )
         self.text_encoder_3 = None
         self.tokenizer_3 = None
@@ -1002,7 +1004,6 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         if output_type == "latent":
             image = latents
-
         else:
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
@@ -1021,6 +1022,13 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         assert (index >= 0).all() and (index < len(self.scheduler.sigmas)).all(), f"index: {index}, num sigmas: {len(self.scheduler.sigmas)}"
         sigma = self.scheduler.sigmas[index].to(sample.device).type(sample.dtype).reshape(-1, 1, 1, 1)
         noisy_sample = sigma * noise + (1.0 - sigma) * sample
+
+        gt_noisy_samples = []
+        for x, n, ind in zip(sample[:, None], noise[:, None], index[:, None]):
+            gt_noisy_sample = self.scheduler.scale_noise(x, self.scheduler.timesteps[ind], n)
+            gt_noisy_samples.append(gt_noisy_sample)
+        gt_noisy_sample = torch.cat(gt_noisy_samples, axis=0)
+        noisy_sample = gt_noisy_sample
 
         target = noise - sample
         
@@ -1071,7 +1079,12 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         mask = pad_mask(tokens['attention_mask'], prefix_len=self.text_decoder.prefix_length).to(self.device)
         input_ids = tokens['input_ids'].to(self.device)
 
-        llm_out = self.text_decoder.forward(input_ids, joint_embed, attention_mask=mask, suffix_input_ids=suffix_input_ids)
+        if hasattr(self, 'wrapped_text_decoder'):
+            decoder = self.wrapped_text_decoder
+        else:
+            decoder = self.text_decoder
+
+        llm_out = decoder(input_ids, joint_embed, attention_mask=mask, suffix_input_ids=suffix_input_ids)
 
         return llm_out.loss
 
@@ -1079,6 +1092,56 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         image_embed, pooled_image_embed = self.encode_image(image)
         
         return self.embed_to_decoder(image_embed, pooled_image_embed, prompt)
+
+    def get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
+        device = timesteps.device
+        sigmas = self.scheduler.sigmas.to(device=device, dtype=dtype)
+        schedule_timesteps = self.scheduler.timesteps.to(device)
+        timesteps = timesteps.to(device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        
+        return sigma
+
+    def embed_to_denoiser_v2(self, image, embeds, pooled_embeds):
+        latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
+        latent = (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+
+        noise = torch.randn_like(latent)
+        # Sample a random timestep for each image
+        # for weighting schemes where we sample timesteps non-uniformly
+        u = torch.normal(mean=0., std=1., size=(len(latent),), device="cpu")
+        u = torch.nn.functional.sigmoid(u)
+        indices = (u * self.scheduler.config.num_train_timesteps).long()
+        timesteps = self.scheduler.timesteps[indices].to(device=latent.device)
+
+        # Add noise according to flow matching.
+        # zt = (1 - texp) * x + texp * z1
+        sigmas = self.get_sigmas(timesteps, n_dim=latent.ndim, dtype=latent.dtype)
+        noisy_latent = (1.0 - sigmas) * latent + sigmas * noise
+
+        target = noise - latent
+
+        # format prompt_embeds correctly
+        B, N, C = embeds.shape
+        if self._hasattr('image_decoder_adapter'):
+            embeds, pooled_embeds = self.image_decoder_adapter(embeds, pooled_embeds)
+
+        embeds = self.format_clip_prompt_embeds(embeds)
+        pooled_embeds = pooled_embeds.reshape(B, C)
+
+        model_output = self.transformer(
+                    hidden_states=noisy_latent,
+                    timestep=timesteps,
+                    encoder_hidden_states=embeds,
+                    pooled_projections=pooled_embeds,
+                    joint_attention_kwargs=None,
+                )
+
+        return model_output.sample, target
 
     def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, return_layers=None):
         latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
@@ -1163,7 +1226,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
                 return_layers=return_layers)
             hidden_list.append(hidden)
         
-        # aggregate hidden
+        # aggregate hidden across time
         hidden = torch.stack(hidden_list).mean(dim=0)
 
         prefix_length = self.text_decoder.prefix_length
@@ -1174,6 +1237,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         if self._hasattr('image_encoder_adapter') and not skip_adapter:
             hidden = self.image_encoder_adapter(hidden)
         else:
+            if self._hasattr('layer_aggregator'):
+                hidden = self.layer_aggregator(hidden)
             hidden = hidden[:, :prefix_length]
         
         # basic conversion to work with our framework
