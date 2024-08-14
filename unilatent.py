@@ -1248,6 +1248,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             hidden = self.layer_aggregator(hidden)
 
         if self._hasattr('image_encoder_adapter') and not skip_adapter:
+            assert hidden is not None
             hidden = self.image_encoder_adapter(hidden)
 
         hidden = hidden[:, :prefix_length]

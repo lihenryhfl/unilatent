@@ -115,9 +115,9 @@ else:
         prefix_dim = 1024
         embed_pool = True
     elif args.clip_text:
-        prefix_length = 79
-        prefix_dim = 2048
-        embed_pool = True
+        prefix_length += 1
+        prefix_dim = 1536
+        embed_pool = False
     else:
         prefix_length += 1
         prefix_dim = 1536
@@ -278,7 +278,7 @@ def sample(batch):
     with torch.no_grad():
         if len(batch[0]) > 1:
             print(f"Sample batch size is large ({len(batch[0])})! Is this really what we want?")
-        image = batch[0].to(accelerator.device)
+        image, prompt = batch[0].to(accelerator.device), batch[1]
         index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
         suffix_input_ids = get_suffix_ids(batch)
         if args.clip:
@@ -337,11 +337,14 @@ else:
             suffix_input_ids = get_suffix_ids(batch)
             if args.clip:
                 embeds, pooled_embeds = pipe.encode_image(image, dtype=torch.float16)
-            elif args.clip_text:
-                embeds, pooled_embeds = pipe.encode_text(prompt)
             else:
+                if args.clip_text:
+                    embeds, pooled_embeds = pipe.encode_text(prompt)
+                else:
+                    embeds = pooled_embeds = None
+
                 embeds, pooled_embeds = pipe.dift_features(image, index, return_layers=args.block_num, 
-                dataset_conditioning=True, num_aggregation_steps=args.n_agg)
+                    dataset_conditioning=True, num_aggregation_steps=args.n_agg, embed=embeds, pooled_embed=pooled_embeds)
 
             loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt, suffix_input_ids=suffix_input_ids)
             accelerator.backward(loss)

@@ -356,6 +356,14 @@ else:
                 d_losses = []
                 c_losses = []
 
+                if args.text_and_image:
+                    batch = next(iter_val_loader)
+                    decoded_text = sample(batch)
+                    print(
+                        f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+                        f"True: {batch[1][0]}"
+                    )
+
                 [x.train() for x in models if x is not None]
                 [x.train() for x in models2 if x is not None]
             

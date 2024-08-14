@@ -152,8 +152,8 @@ for p in pipe.parameters(models=models + models2):
     p.requires_grad = True
 
 accelerator = Accelerator(
-        mixed_precision='fp16',
-        # gradient_accumulation_steps=config.gradient_accumulation_steps
+        # mixed_precision='fp16',
+        mixed_precision='bf16',
     )
 
 def truncate(texts):
