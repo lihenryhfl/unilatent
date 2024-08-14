@@ -10,6 +10,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models import ModelMixin
+from diffusers.models.attention import BasicTransformerBlock
 
 def pad_mask(orig_mask, prefix_len=77):
     extra_zeros = torch.ones(size=(orig_mask.shape[0], prefix_len), dtype=orig_mask.dtype, device=orig_mask.device)
@@ -170,7 +171,9 @@ class LayerAggregator(ModelMixin, ConfigMixin, ModuleUtilsMixin):
     def __init__(self, n_layers):
         super().__init__()
         self.n_layers = n_layers
-        self.register_buffer("layer_logits", torch.zeros(n_layers))
+        # self.register_parameter("layer_logits", torch.zeros(n_layers))
+        # self.layer_logits = torch.nn.Parameter(torch.zeros(n_layers))
+        self.layer_logits = torch.nn.Parameter(torch.randn(n_layers) * 0.01)
         self.softmax = nn.Softmax(dim=0)
 
     def forward(self, layers):
@@ -245,7 +248,7 @@ class Adapter(nn.Module):
         self.redimension = ReDimension(input_dim, output_dim)
 
         if input_length != output_length:
-            self.relength = ReLength(target_len, output_dim, n_heads)
+            self.relength = ReLength(output_length, output_dim, n_heads)
 
     def forward(self, x):
         x = self.redimension(x)
@@ -254,17 +257,27 @@ class Adapter(nn.Module):
             x = self.relength(x)
 
         return x
-        
+
 class EmbedAdapter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
     @register_to_config
-    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16, redimension=True,
-                 use_attn=False, embed_pool=False, attn_drop=0., proj_drop=0.):
+    def __init__(self, input_dim, output_dim, output_length=-1):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.output_length = output_length
-        self.redimension = redimension
-        if self.redimension:
+            
+    def forward(self, x, x_pooled=None):
+        raise NotImplementedError
+        
+class EmbedAdapterV1(EmbedAdapter):
+    @register_to_config
+    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16, use_redimension=True,
+                 use_attn=False, embed_pool=False, attn_drop=0., proj_drop=0.):
+        super().__init__(input_dim=input_dim, output_dim=output_dim, output_length=output_length)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.output_length = output_length
+        if use_redimension:
             self.redimension = ReDimension(input_dim, output_dim)
             self.embed_pool = embed_pool
             if embed_pool:
@@ -272,13 +285,12 @@ class EmbedAdapter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
 
         if use_attn:
             self.attn = MultiHeadSelfAttention(input_dim, n_heads, attn_drop=attn_drop, proj_drop=proj_drop)
+            nn.init.constant_(self.attn.proj.weight, 0)
+            nn.init.constant_(self.attn.proj.bias, 0)
 
         if output_length > -1:
             self.relength = ReLength(output_length, output_dim, n_heads)
-
-        nn.init.constant_(self.attn.proj.weight, 0)
-        nn.init.constant_(self.attn.proj.bias, 0)
-
+            
     def forward(self, x, x_pooled=None):
         if hasattr(self, 'attn'):
             if self.embed_pool:
@@ -288,16 +300,84 @@ class EmbedAdapter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
             else:
                 x = x + self.attn(x)
         
-        if self.redimension:
+        if hasattr(self, 'redimension'):
             x = self.redimension(x)
 
         if hasattr(self, 'relength'):
             x = self.relength(x)
 
-        if self.redimension and self.embed_pool:
+        if hasattr(self, 'pooled_redimension') and self.embed_pool:
             x_pooled = self.pooled_redimension(x_pooled)
             return x, x_pooled
 
+        return x
+
+class EmbedAdapterV2(EmbedAdapter):
+    @register_to_config
+    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16,
+                 use_attn=False, embed_pool=False, dropout=0.):
+        super().__init__(input_dim=input_dim, output_dim=output_dim, output_length=output_length)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.output_length = output_length
+        self.embed_pool = embed_pool
+        assert output_length == -1
+
+        self.redimension = ReDimension(input_dim, output_dim)
+        attn = BasicTransformerBlock(output_dim, n_heads, output_dim // n_heads, dropout=dropout)
+        self.attn = attn
+        self.add_module('attn', attn)
+
+    def forward(self, x, x_pooled=None):
+        if self.embed_pool:
+            x = torch.cat([x, x_pooled], axis=1)
+
+        x = self.redimension(x)
+
+        if hasattr(self, 'attn'):
+            x = x + self.attn(x)
+
+        if self.embed_pool:
+            x, x_pooled = x[:, :-1], x[:, -1:]
+            return x, x_pooled
+        
+        return x
+
+
+class EmbedAdapterV3(EmbedAdapter):
+    @register_to_config
+    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16,
+                 use_attn=False, embed_pool=False, dropout=0.):
+        super().__init__(input_dim=input_dim, output_dim=output_dim, output_length=output_length)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.output_length = output_length
+        self.embed_pool = embed_pool
+
+        self.redimension = ReDimension(input_dim, output_dim)
+        attn = BasicTransformerBlock(output_dim, n_heads, output_dim // n_heads, dropout=dropout)
+        self.attn = attn
+        self.add_module('attn', attn)
+
+        if output_length > -1:
+            self.relength = ReLength(output_length, output_dim, n_heads)
+
+    def forward(self, x, x_pooled=None):
+        if self.embed_pool:
+            x = torch.cat([x, x_pooled], axis=1)
+
+        x = self.redimension(x)
+
+        if hasattr(self, 'attn'):
+            x = x + self.attn(x)
+
+        if hasattr(self, 'relength'):
+            x = self.relength(x)
+
+        if self.embed_pool:
+            x, x_pooled = x[:, :-1], x[:, -1:]
+            return x, x_pooled
+        
         return x
         
 

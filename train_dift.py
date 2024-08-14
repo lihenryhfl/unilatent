@@ -23,6 +23,8 @@ from transformers import (
 # from caption_decoder import TextDecoder
 from caption_decoder_v1 import TextDecoder
 from utils import FrozenDecoderTrainableDataTokenWrapper, LayerAggregator
+from utils import EmbedAdapterV1 as EmbedAdapter
+# from utils import EmbedAdapterV2 as EmbedAdapter
 
 from transformer import SD3Transformer2DModel
 
@@ -31,15 +33,22 @@ parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2
 parser.add_argument('--load_from', default='', help='the dir to load logs and models')
 parser.add_argument('--batch_size', type=int, default=32)
 parser.add_argument('--index', type=int, default=750)
+parser.add_argument('--n_agg', type=int, default=1)
 
 parser.add_argument('--block_num', nargs='+', type=int, default='12')
 parser.add_argument('--image_size', type=int, default=-1)
 parser.add_argument('--step_offset', type=int, default=0)
+parser.add_argument('--n_steps', type=int, default=200_000)
 parser.add_argument('--sample_and_exit', action='store_true')
+parser.add_argument('--debug', action='store_true')
 parser.add_argument('--clip', action='store_true')
+parser.add_argument('--clip_text', action='store_true')
+parser.add_argument('--no_adapter', action='store_true')
 parser.add_argument('--pretrain', action='store_true')
 parser.add_argument('--layer_aggregator', action='store_true')
 args = parser.parse_args()
+
+assert not (args.clip_text and args.clip)
 
 args.block_num = [args.block_num] if not isinstance(args.block_num, list) else args.block_num
 print("BLOCK NUM", args.block_num)
@@ -104,13 +113,20 @@ else:
     if args.clip:
         prefix_length = 259
         prefix_dim = 1024
+        embed_pool = True
+    elif args.clip_text:
+        prefix_length = 79
+        prefix_dim = 2048
+        embed_pool = True
     else:
+        prefix_length += 1
         prefix_dim = 1536
+        embed_pool = False
 
     text_decoder = TextDecoder(
         prefix_length=prefix_length,
         prefix_inner_dim=prefix_dim,
-        vocab_size=len(decoder_tokenizer))
+        vocab_size=len(decoder_tokenizer) + len(decoder_tokenizer.get_added_vocab()))
     pipe.text_decoder = text_decoder
 
     pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
@@ -120,8 +136,11 @@ else:
     transformer.load_state_dict(pipe.transformer.state_dict())
     pipe.transformer = transformer
 
-
     soft_prompter = image_encoder_adapter = None
+    image_encoder_adapter = EmbedAdapter(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool)
+    # image_encoder_adapter = EmbedAdapter(prefix_dim * len(args.block_num), prefix_dim, -1, embed_pool=embed_pool, use_attn=True)
+    if args.no_adapter:
+        image_encoder_adapter = None
         
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
@@ -139,6 +158,10 @@ else:
         soft_prompter=soft_prompter,
         layer_aggregator=layer_aggregator
     )
+
+if args.layer_aggregator:
+    layer_logits = pipe.layer_aggregator.layer_logits
+    print(f"Layer logits: {layer_logits}")
 
 def get_dataloader(data_config, val=False):
     batch_size = 1 if val else args.batch_size
@@ -170,7 +193,7 @@ def get_dataloader(data_config, val=False):
 
 val_loader = get_dataloader(val_config, val=True)
 
-if not args.sample_and_exit:
+if args.debug or not args.sample_and_exit:
     dataloader = get_dataloader(train_config)
 else:
     dataloader = val_loader
@@ -181,10 +204,13 @@ ft_models = []
 if args.clip:
     ft_models.append(pipe.clip_image_encoder)
 
-if args.layer_aggregator:
-    models.append(layer_aggregator)
+if args.clip_text:
+    ft_models.extend([pipe.text_encoder, pipe.text_encoder_2])
 
-num_steps = 200_000
+if args.layer_aggregator:
+    models.append(pipe.layer_aggregator)
+
+num_steps = args.n_steps
 optimizer = torch.optim.AdamW(lr=2e-5, params=pipe.parameters(models=models))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
@@ -257,6 +283,8 @@ def sample(batch):
         suffix_input_ids = get_suffix_ids(batch)
         if args.clip:
             embeds, pooled_embeds = pipe.encode_image(image, dtype=torch.float16)
+        elif args.clip_text:
+            embeds, pooled_embeds = pipe.encode_text(prompt)
         else:
             embeds, pooled_embeds = pipe.dift_features(
                 image, index, return_layers=args.block_num, dataset_conditioning=True)
@@ -309,14 +337,16 @@ else:
             suffix_input_ids = get_suffix_ids(batch)
             if args.clip:
                 embeds, pooled_embeds = pipe.encode_image(image, dtype=torch.float16)
+            elif args.clip_text:
+                embeds, pooled_embeds = pipe.encode_text(prompt)
             else:
                 embeds, pooled_embeds = pipe.dift_features(image, index, return_layers=args.block_num, 
-                dataset_conditioning=True)
+                dataset_conditioning=True, num_aggregation_steps=args.n_agg)
 
             loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt, suffix_input_ids=suffix_input_ids)
             accelerator.backward(loss)
 
-            for p in pipe.parameters():
+            for n, p in pipe.named_parameters():
                 if p.grad is not None:
                     torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
 
@@ -340,6 +370,9 @@ else:
                     f"Recon: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} | "
                     f"True: {batch[1][0]}"
                 )
+                if args.layer_aggregator:
+                    layer_logits = pipe.layer_aggregator.layer_logits
+                    print(f"Layer logits: {layer_logits}")
 
                 losses = []
             

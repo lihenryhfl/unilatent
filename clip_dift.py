@@ -22,7 +22,8 @@ from transformers import (
 
 # from caption_decoder import TextDecoder
 from caption_decoder_v1 import TextDecoder
-from utils import ReLength, EmbedAdapter, SoftPrompter
+from utils import ReLength, SoftPrompter
+from utils import EmbedAdapterV2 as EmbedAdapter
 
 from transformer import SD3Transformer2DModel
 
@@ -77,7 +78,7 @@ train_config = {
 if args.load_from:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 else:
-    pipe = UniLatentPipeline.from_pretrained('/mnt/bn/us-aigc-temp/henry/data/unilatent/train_clip_sd3_2/current/', torch_dtype=torch.float32)
+    pipe = UniLatentPipeline.from_pretrained('/mnt/bn/us-aigc-temp/henry/data/unilatent/train_clip_sd3_2/step_14999/', torch_dtype=torch.float32)
 
     add_vocab_size = 1
     decoder_tokenizer = GPT2Tokenizer.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt_tokenizer/')
@@ -157,7 +158,7 @@ if not args.sample_and_exit:
 else:
     dataloader = val_loader
 
-num_steps = 200_000
+num_steps = 100_000
 
 models = [pipe.text_decoder]
 models = [x.train() for x in models]

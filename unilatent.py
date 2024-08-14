@@ -959,6 +959,8 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
                 timestep = t.expand(latent_model_input.shape[0])
                 assert self.joint_attention_kwargs is None
 
+                print("IN __call__", prompt_embeds.shape, pooled_prompt_embeds.shape)
+
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
@@ -1078,12 +1080,18 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
                                      max_length=120, padding="longest")
         mask = pad_mask(tokens['attention_mask'], prefix_len=self.text_decoder.prefix_length).to(self.device)
         input_ids = tokens['input_ids'].to(self.device)
-
+        
         if hasattr(self, 'wrapped_text_decoder'):
             decoder = self.wrapped_text_decoder
         else:
             decoder = self.text_decoder
 
+        target_len = input_ids.shape[1] + joint_embed.shape[1]
+        if suffix_input_ids is not None:
+            target_len += 1 
+
+        assert target_len == mask.shape[1], f"{input_ids.shape}, {mask.shape}, {joint_embed.shape}, {suffix_input_ids is None}, {target_len}"
+        assert input_ids.max() < decoder.transformer.transformer.wte.weight.shape[0], f"{input_ids.max()}, {decoder.transformer.transformer.wte.weight.shape}"
         llm_out = decoder(input_ids, joint_embed, attention_mask=mask, suffix_input_ids=suffix_input_ids)
 
         return llm_out.loss
@@ -1232,14 +1240,17 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         prefix_length = self.text_decoder.prefix_length
         if dataset_conditioning:
             prefix_length = prefix_length - 1
+        else:
+            assert False
 
         assert hidden.shape[1] >= prefix_length, f"{hidden.shape, self.text_decoder.prefix_length}"
+        if self._hasattr('layer_aggregator'):
+            hidden = self.layer_aggregator(hidden)
+
         if self._hasattr('image_encoder_adapter') and not skip_adapter:
             hidden = self.image_encoder_adapter(hidden)
-        else:
-            if self._hasattr('layer_aggregator'):
-                hidden = self.layer_aggregator(hidden)
-            hidden = hidden[:, :prefix_length]
+
+        hidden = hidden[:, :prefix_length]
         
         # basic conversion to work with our framework
         return hidden[:, :-1], hidden[:, -1:]

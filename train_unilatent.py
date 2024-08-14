@@ -23,7 +23,10 @@ from transformers import (
 
 from caption_decoder_v1 import TextDecoder
 from transformer import SD3Transformer2DModel
-from utils import EmbedAdapter, get_lr
+# from utils import EmbedAdapter
+from utils import EmbedAdapterV2 as EmbedAdapter
+from utils import EmbedAdapterV3
+from utils import get_lr
 
 parser = argparse.ArgumentParser(description="Training.")
 parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2text/', help='the dir to save logs and models')
@@ -46,12 +49,14 @@ if not args.load_from:
     pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
     pipe.clip_image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
 
-    transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
-    transformer.load_state_dict(pipe.transformer.state_dict())
-    pipe.transformer = transformer
-
-    image_encoder_adapter = EmbedAdapter(1024, 2048, 77, embed_pool=True, use_attn=True)
-    image_decoder_adapter = EmbedAdapter(2048, 2048, 77, embed_pool=True, use_attn=True)
+    # transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
+    # transformer.load_state_dict(pipe.transformer.state_dict())
+    # pipe.transformer = transformer
+    
+    # image_encoder_adapter = EmbedAdapter(1024, 2048, -1, embed_pool=True, use_attn=True)
+    # image_decoder_adapter = EmbedAdapter(2048, 2048, -1, embed_pool=True, use_attn=True)
+    image_encoder_adapter = EmbedAdapterV3(1024, 2048, 78, embed_pool=True, use_attn=True)
+    image_decoder_adapter = EmbedAdapterV3(2048, 2048, 78, embed_pool=True, use_attn=True)
 
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
