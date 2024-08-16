@@ -1078,7 +1078,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         processed_prompt = [self.decoder_tokenizer.bos_token + txt + self.decoder_tokenizer.eos_token for txt in prompt]
         tokens = self.decoder_tokenizer(processed_prompt, return_tensors='pt', truncation=True,
                                      max_length=120, padding="longest")
-        mask = pad_mask(tokens['attention_mask'], prefix_len=self.text_decoder.prefix_length).to(self.device)
+        input_mask = tokens['attention_mask']
         input_ids = tokens['input_ids'].to(self.device)
         
         if hasattr(self, 'wrapped_text_decoder'):
@@ -1090,9 +1090,9 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         if suffix_input_ids is not None:
             target_len += 1 
 
-        assert target_len == mask.shape[1], f"{input_ids.shape}, {mask.shape}, {joint_embed.shape}, {suffix_input_ids is None}, {target_len}"
+        # assert target_len == mask.shape[1], f"{input_ids.shape}, {mask.shape}, {joint_embed.shape}, {suffix_input_ids is None}, {target_len}"
         assert input_ids.max() < decoder.transformer.transformer.wte.weight.shape[0], f"{input_ids.max()}, {decoder.transformer.transformer.wte.weight.shape}"
-        llm_out = decoder(input_ids, joint_embed, attention_mask=mask, suffix_input_ids=suffix_input_ids)
+        llm_out = decoder(input_ids, joint_embed, attention_mask=input_mask, suffix_input_ids=suffix_input_ids)
 
         return llm_out.loss
 

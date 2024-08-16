@@ -12,6 +12,22 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models import ModelMixin
 from diffusers.models.attention import BasicTransformerBlock
 
+from data.builder import build_dataset, build_dataloader
+from aspect_ratio_sampler import AspectRatioBatchSampler
+from torch.utils.data import RandomSampler
+
+def unwrap(accelerator, pipe):
+    pipe.transformer = accelerator.unwrap_model(pipe.transformer)
+    pipe.text_encoder = accelerator.unwrap_model(pipe.text_encoder)
+    pipe.text_encoder_2 = accelerator.unwrap_model(pipe.text_encoder_2)
+    pipe.clip_image_encoder = accelerator.unwrap_model(pipe.clip_image_encoder)
+    pipe.text_decoder = accelerator.unwrap_model(pipe.text_decoder)
+    pipe.vae = accelerator.unwrap_model(pipe.vae)
+    pipe.image_encoder_adapter = accelerator.unwrap_model(pipe.image_encoder_adapter)
+    pipe.image_decoder_adapter = accelerator.unwrap_model(pipe.image_decoder_adapter)
+    pipe.layer_aggregator = accelerator.unwrap_model(pipe.layer_aggregator)
+    return pipe
+
 def pad_mask(orig_mask, prefix_len=77):
     extra_zeros = torch.ones(size=(orig_mask.shape[0], prefix_len), dtype=orig_mask.dtype, device=orig_mask.device)
     return torch.cat([extra_zeros, orig_mask], axis=1)
@@ -24,7 +40,42 @@ def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
-class FrozenDecoderTrainableDataTokenWrapper:
+def get_suffix_ids(batch, tokenizer, device):
+    idxs = batch[-1]['data_idx']
+    # assert (idxs < len(train_config['roots'])).all()
+    suffix_text = [f'<|dataset{i}|>' for i in idxs]
+    suffix_ids = tokenizer(suffix_text, return_tensors='pt', max_length=1).input_ids.to(device)
+    return suffix_ids
+
+def get_dataloader(args, data_config, val=False):
+    batch_size = 1 if val else args.batch_size
+    kwargs = {}
+    if hasattr(args, 'image_size') and args.image_size > 0:
+        resolution = args.image_size
+        aspect_ratio_type = f'ASPECT_RATIO_{args.image_size}' if args.image_size in [256, 512] else 'ASPECT_RATIO_512'
+        data_config['type'] = 'FlexibleInternalData'
+        kwargs['return_image_id'] = val
+    else:
+        resolution = 512
+        aspect_ratio_type = 'ASPECT_RATIO_512'
+        data_config['type'] = 'FlexibleInternalDataMS'
+        kwargs['return_image_id'] = val
+    
+    dataset = build_dataset(
+        data_config, resolution=resolution, aspect_ratio_type=aspect_ratio_type,
+        real_prompt_ratio=1.0, max_length=77, **kwargs
+    )
+    if hasattr(args, 'image_size') and args.image_size > 0:
+        dataloader = build_dataloader(dataset, batch_size=batch_size, num_workers=10)
+    else:
+        batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(dataset), dataset=dataset,
+                                            batch_size=batch_size, aspect_ratios=dataset.aspect_ratio, drop_last=True,
+                                            ratio_nums=dataset.ratio_nums, valid_num=0)
+        dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=10)
+    
+    return dataloader
+
+class GradientFixer:
     def __init__(self, decoder, tokenizer, dtype=torch.float32):
         self.decoder = decoder
         self.tokenizer = tokenizer
@@ -37,12 +88,12 @@ class FrozenDecoderTrainableDataTokenWrapper:
         self.gradient_mask = mask
 
         for n, p in self.decoder.named_parameters():
-            if 'wte' not in n:
-                p.requires_grad = False
-                print(f"Not training {n}.")
-            else:
+            if 'wte' in n or 'prefix' in n:
                 p.requires_grad = True
-                print(f"Training {n}.")
+                # print(f"Training {n}.")
+            else:
+                p.requires_grad = False
+                # print(f"Not training {n}.")
 
     def __getattr__(self, name):
         """
@@ -55,19 +106,19 @@ class FrozenDecoderTrainableDataTokenWrapper:
 
         return obj
 
-    def forward(self, *args, **kwargs):
-        return self.decoder(*args, **kwargs)
-
     def fix_gradients(self):
         with torch.no_grad():
             for n, p in self.decoder.named_parameters():
-                if 'wte' not in n:
-                    assert not p.requires_grad
-                else:
+                if 'wte' in n:
                     if p.grad is not None:
+                        self.gradient_mask = self.gradient_mask.to(p.device)
                         p.grad *= self.gradient_mask
                     else:
                         print(f"In FrozenDecoderTrainableDataTokenWrapper: {n} has no gradient!")
+                else:
+                    if 'prefix' not in n:
+                        assert not p.requires_grad, f"{n}"
+                    
 
 
 class MultiHeadCrossAttention(nn.Module):

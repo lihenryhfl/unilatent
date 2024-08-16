@@ -22,8 +22,7 @@ from transformers import (
 )
 
 from caption_decoder_v1 import TextDecoder
-from transformer import SD3Transformer2DModel
-from utils import get_lr
+from utils import get_lr, get_suffix_ids, get_dataloader
 from utils import EmbedAdapterV1
 from utils import EmbedAdapterV2
 from utils import EmbedAdapterV3
@@ -31,27 +30,61 @@ from utils import EmbedAdapterV3
 parser = argparse.ArgumentParser(description="Training.")
 parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2text/', help='the dir to save logs and models')
 parser.add_argument('--load_from', default='', help='the dir to load from')
-parser.add_argument('--adapter_version', default='v1', help='the dir to load from')
+parser.add_argument('--adapter_version', default='v1', help='version of the pre-decoder / pre-denoiser adapter')
 parser.add_argument('--batch_size', type=int, default=48)
 parser.add_argument('--step_offset', type=int, default=0)
+parser.add_argument('--num_steps', type=int, default=100_000)
 parser.add_argument('--lam', type=float, default=1.)
 parser.add_argument('--sample_and_exit', action='store_true')
 parser.add_argument('--text', action='store_true')
 parser.add_argument('--text_and_image', action='store_true')
+parser.add_argument('--pretrain_adapter', action='store_true')
 parser.add_argument('--debug', action='store_true')
 args = parser.parse_args()
+
+val_config = {
+    'type': 'FlexibleInternalData',
+    'roots': [
+        '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
+    ],
+    'json_lst': [
+        '/mnt/bn/us-aigc-temp/henry/test.json',
+    ],
+    'load_vae_feat': False,
+    'load_t5_feat': False,
+    'transform': 'default_train'
+}
+train_config = {
+    'roots': [
+        '/mnt/bn/us-aigc-temp/henry/coco_2014/train2014/',
+        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
+        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
+        '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/',
+        '/mnt/bn/aigc-us/zjl/openimages/data/',
+    ],
+    'json_lst': [
+        '/mnt/bn/us-aigc-temp/henry/train.json',
+        '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
+        '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json',
+        '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json',
+        '/mnt/bn/aigc-us/zjl/openimages/data/meta_data.json',
+    ],
+    'load_vae_feat': False,
+    'load_t5_feat': False,
+    'transform': 'default_train'
+}
 
 if not args.load_from:
     pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float32)
 
     decoder_tokenizer = GPT2Tokenizer.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt_tokenizer/')
     decoder_tokenizer.add_special_tokens({'pad_token': decoder_tokenizer.eos_token})
+    decoder_tokenizer.add_tokens([f'<|dataset{i}|>' for i in range(len(train_config['roots']))])
     pipe.decoder_tokenizer = decoder_tokenizer
-    # prefix_length = 258
     prefix_length = 78
 
-    text_decoder = TextDecoder(prefix_length=prefix_length, prefix_inner_dim=2048, prefix_hidden_dim=2048, 
-                                vocab_size=decoder_tokenizer.vocab_size + 1)
+    text_decoder = TextDecoder(prefix_length=prefix_length + 1, prefix_inner_dim=2048, prefix_hidden_dim=2048, 
+                                vocab_size=len(decoder_tokenizer) + len(decoder_tokenizer.get_added_vocab()))
     pipe.text_decoder = text_decoder
 
     pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
@@ -75,7 +108,6 @@ if not args.load_from:
         raise NotImplementedError
 
     image_encoder_adapter = image_decoder_adapter = None
-    # image_encoder_adapter = EmbedAdapter(1024, 2048, prefix_length, embed_pool=True, use_attn=True)
     image_encoder_adapter = EmbedAdapter(1024, 2048, prefix_length, embed_pool=True, use_attn=True)
     # image_decoder_adapter = EmbedAdapter(2048, 2048, adapter_len, embed_pool=True, use_attn=True)
 
@@ -97,76 +129,25 @@ if not args.load_from:
 else:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 
-val_data_config = {
-    'type': 'FlexibleInternalDataMS',
-    'roots': [
-        '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
-    ],
-    'json_lst': [
-        '/mnt/bn/us-aigc-temp/henry/test.json',
-    ],
-    'load_vae_feat': False,
-    'load_t5_feat': False
-}
-val_dataset = build_dataset(
-    val_data_config, resolution=512, aspect_ratio_type='ASPECT_RATIO_512',
-    real_prompt_ratio=0.0, max_length=77, return_image_id=True
-)
-val_batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(val_dataset), dataset=val_dataset,
-                                    batch_size=1, aspect_ratios=val_dataset.aspect_ratio, drop_last=True,
-                                    ratio_nums=val_dataset.ratio_nums, valid_num=0)
-val_loader = build_dataloader(val_dataset, batch_sampler=val_batch_sampler, num_workers=10)
+val_loader = get_dataloader(args, val_config, val=True)
 
-if args.debug or args.sample_and_exit:
-    dataloader = val_loader
+if args.debug or not args.sample_and_exit:
+    dataloader = get_dataloader(args, train_config)
 else:
-    data_config = {
-        'type': 'FlexibleInternalDataMS',
-        'roots': [
-            # '/mnt/bn/us-aigc-temp/henry/coco_2014/val/val2014/',
-            '/mnt/bn/us-aigc-temp/henry/coco_2014/train2014/',
-            '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/',
-            '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/',
-            '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/',
-            '/mnt/bn/aigc-us/zjl/openimages/data/',
-        ],
-        'json_lst': [
-            # '/mnt/bn/us-aigc-temp/henry/test.json',
-            '/mnt/bn/us-aigc-temp/henry/train.json',
-            '/mnt/bn/aigc-us/zjl/laion-coco-aesthetic/data_max1024/meta_data_coco_edited.json',
-            '/mnt/bn/aigc-us/zjl/recap_datacom_1b_aesthetic_subset/data/aes5_meta_data_all.json',
-            '/mnt/bn/aigc-us/zjl/sharegpt4v_processed_data/data/meta_data.json',
-            '/mnt/bn/aigc-us/zjl/openimages/data/meta_data.json',
-        ],
-        'load_vae_feat': False,
-        'load_t5_feat': False
-    }
-    dataset = build_dataset(
-        data_config, resolution=512, aspect_ratio_type='ASPECT_RATIO_512',
-        real_prompt_ratio=0.0, max_length=77,
-    )
-    batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(dataset), dataset=dataset,
-                                        batch_size=args.batch_size, aspect_ratios=dataset.aspect_ratio, drop_last=True,
-                                        ratio_nums=dataset.ratio_nums, valid_num=0)
-    dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=10)
+    dataloader = val_loader
 
-num_steps = 100_000
+num_steps = args.num_steps
 
 # models = [pipe.text_decoder]
 # models = [pipe.text_encoder, pipe.text_encoder_2]
 if args.text:
     models = [pipe.image_decoder_adapter]
-    # models2 = [pipe.transformer]
-    # models = [pipe.transformer]
     models2 = []
 elif args.text_and_image:
     models = [pipe.image_encoder_adapter, pipe.text_decoder, pipe.image_decoder_adapter]
-    # models2 = [pipe.clip_image_encoder]
     models2 = []
 else:
     models = [pipe.image_encoder_adapter]
-    # models = [pipe.image_encoder_adapter, pipe.image_decoder_adapter]
-    # models2 = [pipe.clip_image_encoder]
     models2 = []
 
 [x.train() for x in models if x is not None]
@@ -241,15 +222,17 @@ def save(pipe, path):
 pipe = prepare(pipe)
 
 def sample(batch):
-    image, prompt = batch[0].to('cuda'), truncate(batch[1])
+    image, prompt = batch[0].to('cuda'), batch[1]
     with torch.no_grad():
         prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt[:1])
         image_embeds, pooled_image_embeds = pipe.encode_image(image[:1], dtype=torch.float16)
         embeds = torch.cat([prompt_embeds, image_embeds])
         pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds])
         embeds = torch.cat([embeds, pooled_embeds], axis=1)
+        suffix_input_ids = get_suffix_ids(batch, pipe.decoder_tokenizer, accelerator.device)
         decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
-                            eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device)[0]
+                            eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device,
+                            suffix_input_ids=suffix_input_ids)[0]
         decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
     return decoded_text
 
@@ -271,6 +254,9 @@ if args.sample_and_exit:
             with open(save_path, 'w') as f:
                 json.dump(json_list, f)
 else:
+    if args.pretrain_adapter:
+        gradient_fixer = GradientFixer(pipe.text_decoder, pipe.decoder_tokenizer)
+    
     d_losses = []
     c_losses = []
     step = 0
@@ -286,7 +272,7 @@ else:
             
             # prepare data
             image, prompt = batch[0].to('cuda'), batch[1]
-            # index = torch.randint(0, 1000, size=(len(image),))
+            suffix_input_ids = get_suffix_ids(batch, pipe.decoder_tokenizer, accelerator.device)
 
             # run model
             if args.text:
@@ -310,7 +296,7 @@ else:
             d_loss = torch.nan_to_num(d_loss)
 
             if args.text_and_image:
-                c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt)
+                c_loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt, suffix_input_ids=suffix_input_ids)
             else:
                 c_loss = torch.tensor(0., dtype=torch.float16, device=accelerator.device)
 
@@ -324,6 +310,9 @@ else:
 
             loss = d_loss.mean() + (args.lam * c_loss.mean())
             accelerator.backward(loss)
+
+            if args.pretrain_adapter:
+                gradient_fixer.fix_gradients()
 
             num_params, num_nans = 0, 0
             for p in pipe.parameters():
@@ -361,6 +350,7 @@ else:
                     decoded_text = sample(batch)
                     print(
                         f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
+                        f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
                         f"True: {batch[1][0]}"
                     )
 

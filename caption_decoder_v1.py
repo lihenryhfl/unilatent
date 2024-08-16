@@ -9,7 +9,7 @@ from transformers.modeling_utils import ModuleUtilsMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models import ModelMixin
 
-from utils import ReLength
+from utils import pad_mask
 
 
 # Modified from ClipCaptionModel in https://github.com/thu-ml/unidiffuser/blob/main/libs/caption_decoder.py
@@ -126,6 +126,19 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         )
         self.transformer = GPT2LMHeadModel(gpt_config)
 
+    def loss(self, lm_logits, labels):
+        # move labels to correct device to enable model parallelism
+        labels = labels.to(lm_logits.device)
+        # Shift so that tokens < n predict n
+        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        loss = loss.reshape(*shift_labels.shape)
+
+        return loss
+
     def get_prefix_embeds(self, x, suffix_input_ids):
         hidden = self.encode_prefix(x)
         prefix_embeds = self.decode_prefix(hidden)
@@ -140,7 +153,8 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         features: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        suffix_input_ids: Optional[torch.Tensor] = None
+        suffix_input_ids: Optional[torch.Tensor] = None,
+        verbose: bool = False,
     ):
         """
         Args:
@@ -157,10 +171,19 @@ class TextDecoder(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         prefix_embeds = self.get_prefix_embeds(features, suffix_input_ids)
         embedding_cat = torch.cat((prefix_embeds, embedding_text), dim=1)
 
+        if attention_mask is not None:
+            padded_mask = pad_mask(attention_mask, prefix_len=self.prefix_length).to(input_ids.device)
+
         if labels is None:
             dummy_token = self.get_dummy_token(input_ids.shape[0], input_ids.device)
             labels = torch.cat((dummy_token, input_ids), dim=1)
-        out = self.transformer(inputs_embeds=embedding_cat, labels=labels, attention_mask=attention_mask)
+        out = self.transformer(inputs_embeds=embedding_cat, labels=labels, attention_mask=padded_mask)
+
+        our_loss = self.loss(out.logits, labels)
+        if verbose:
+            print(our_loss.shape, attention_mask.shape)
+        our_loss = our_loss[:, (self.prefix_length - 1):] * attention_mask.to(our_loss.device)
+        out.loss = our_loss.mean()
 
         return out
 

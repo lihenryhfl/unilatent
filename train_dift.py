@@ -1,15 +1,10 @@
+from multiprocessing.connection import Pipe
 import os
 import json
 import argparse
 import torch
 from diffusers import StableDiffusion3Pipeline
-from unilatent import UniLatentPipeline, retrieve_timesteps
-
-from data.builder import build_dataset, build_dataloader
-from aspect_ratio_sampler import AspectRatioBatchSampler
-from torch.utils.data import RandomSampler
-
-from torch.nn.parallel import DistributedDataParallel as DDP
+from unilatent import UniLatentPipeline
 
 from tqdm import tqdm
 from diffusers import get_cosine_schedule_with_warmup
@@ -22,9 +17,8 @@ from transformers import (
 
 # from caption_decoder import TextDecoder
 from caption_decoder_v1 import TextDecoder
-from utils import FrozenDecoderTrainableDataTokenWrapper, LayerAggregator
-from utils import EmbedAdapterV1 as EmbedAdapter
-# from utils import EmbedAdapterV2 as EmbedAdapter
+from utils import LayerAggregator, GradientFixer, get_suffix_ids, get_dataloader, unwrap
+from utils import EmbedAdapterV1, EmbedAdapterV2, EmbedAdapterV3
 
 from transformer import SD3Transformer2DModel
 
@@ -43,9 +37,10 @@ parser.add_argument('--sample_and_exit', action='store_true')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--clip', action='store_true')
 parser.add_argument('--clip_text', action='store_true')
-parser.add_argument('--no_adapter', action='store_true')
+parser.add_argument('--adapter_type', default='')
 parser.add_argument('--pretrain', action='store_true')
 parser.add_argument('--layer_aggregator', action='store_true')
+parser.add_argument('--pretrain_adapter', action='store_true')
 args = parser.parse_args()
 
 assert not (args.clip_text and args.clip)
@@ -137,9 +132,13 @@ else:
     pipe.transformer = transformer
 
     soft_prompter = image_encoder_adapter = None
-    image_encoder_adapter = EmbedAdapter(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool)
-    # image_encoder_adapter = EmbedAdapter(prefix_dim * len(args.block_num), prefix_dim, -1, embed_pool=embed_pool, use_attn=True)
-    if args.no_adapter:
+    if args.adapter_type == 'v1':
+        image_encoder_adapter = EmbedAdapterV1(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool)
+    elif args.adapter_type == 'v2':
+        image_encoder_adapter = EmbedAdapterV2(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
+    elif args.adapter_type == 'v3':
+        image_encoder_adapter = EmbedAdapterV3(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
+    elif not args.adapter_type or args.adapter_type == 'none':
         image_encoder_adapter = None
         
     pipe = UniLatentPipeline(
@@ -163,38 +162,10 @@ if args.layer_aggregator:
     layer_logits = pipe.layer_aggregator.layer_logits
     print(f"Layer logits: {layer_logits}")
 
-def get_dataloader(data_config, val=False):
-    batch_size = 1 if val else args.batch_size
-    kwargs = {}
-    if args.image_size > 0:
-        resolution = args.image_size
-        aspect_ratio_type = f'ASPECT_RATIO_{args.image_size}' if args.image_size in [256, 512] else 'ASPECT_RATIO_512'
-        data_config['type'] = 'FlexibleInternalData'
-        kwargs['return_image_id'] = val
-    else:
-        resolution = 512
-        aspect_ratio_type = 'ASPECT_RATIO_512'
-        data_config['type'] = 'FlexibleInternalDataMS'
-        kwargs['return_image_id'] = val
-    
-    dataset = build_dataset(
-        data_config, resolution=resolution, aspect_ratio_type=aspect_ratio_type,
-        real_prompt_ratio=1.0, max_length=77, **kwargs
-    )
-    if args.image_size > 0:
-        dataloader = build_dataloader(dataset, batch_size=batch_size, num_workers=10)
-    else:
-        batch_sampler = AspectRatioBatchSampler(sampler=RandomSampler(dataset), dataset=dataset,
-                                            batch_size=batch_size, aspect_ratios=dataset.aspect_ratio, drop_last=True,
-                                            ratio_nums=dataset.ratio_nums, valid_num=0)
-        dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=10)
-    
-    return dataloader
-
-val_loader = get_dataloader(val_config, val=True)
+val_loader = get_dataloader(args, val_config, val=True)
 
 if args.debug or not args.sample_and_exit:
-    dataloader = get_dataloader(train_config)
+    dataloader = get_dataloader(args, train_config)
 else:
     dataloader = val_loader
 
@@ -228,7 +199,7 @@ for p in pipe.parameters(models=models + ft_models):
     p.requires_grad = True
 
 accelerator = Accelerator(
-        mixed_precision='fp16',
+        mixed_precision='bf16',
     )
 
 pipe = pipe.to(accelerator.device)
@@ -267,27 +238,23 @@ def get_lr(optimizer):
 
 print(f"TOTAL TRANSFORMER LAYERS: {len(pipe.transformer.transformer_blocks)} | OUR CHOSEN BLOCK: {args.block_num}")
 
-def get_suffix_ids(batch):
-    idxs = batch[-1]['data_idx']
-    assert (idxs < len(train_config['roots'])).all()
-    suffix_text = [f'<|dataset{i}|>' for i in idxs]
-    suffix_ids = pipe.decoder_tokenizer(suffix_text, return_tensors='pt', max_length=1).input_ids.to(accelerator.device)
-    return suffix_ids
-
 def sample(batch):
     with torch.no_grad():
         if len(batch[0]) > 1:
             print(f"Sample batch size is large ({len(batch[0])})! Is this really what we want?")
         image, prompt = batch[0].to(accelerator.device), batch[1]
         index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
-        suffix_input_ids = get_suffix_ids(batch)
+        suffix_input_ids = get_suffix_ids(batch, pipe.decoder_tokenizer, accelerator.device)
         if args.clip:
             embeds, pooled_embeds = pipe.encode_image(image, dtype=torch.float16)
-        elif args.clip_text:
-            embeds, pooled_embeds = pipe.encode_text(prompt)
         else:
-            embeds, pooled_embeds = pipe.dift_features(
-                image, index, return_layers=args.block_num, dataset_conditioning=True)
+            if args.clip_text:
+                embeds, pooled_embeds = pipe.encode_text(prompt)
+            else:
+                embeds = pooled_embeds = None
+
+            embeds, pooled_embeds = pipe.dift_features(image, index, return_layers=args.block_num, 
+                dataset_conditioning=True, num_aggregation_steps=args.n_agg, embed=embeds, pooled_embed=pooled_embeds)
         embeds = torch.cat([embeds, pooled_embeds], axis=1)
         decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
                             eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device,
@@ -316,6 +283,9 @@ if args.sample_and_exit:
             with open(save_path, 'w') as f:
                 json.dump(json_list, f)
 else:
+    if args.pretrain_adapter:
+        gradient_fixer = GradientFixer(pipe.text_decoder, pipe.decoder_tokenizer)
+
     losses = []
     step = 0
     while step < args.step_offset:
@@ -334,7 +304,7 @@ else:
             index = torch.zeros(size=(len(image),), dtype=torch.long) + args.index
 
             # run model
-            suffix_input_ids = get_suffix_ids(batch)
+            suffix_input_ids = get_suffix_ids(batch, pipe.decoder_tokenizer, accelerator.device)
             if args.clip:
                 embeds, pooled_embeds = pipe.encode_image(image, dtype=torch.float16)
             else:
@@ -349,6 +319,9 @@ else:
             loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt, suffix_input_ids=suffix_input_ids)
             accelerator.backward(loss)
 
+            if args.pretrain_adapter:
+                gradient_fixer.fix_gradients()
+
             for n, p in pipe.named_parameters():
                 if p.grad is not None:
                     torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
@@ -362,9 +335,11 @@ else:
 
             if accelerator.is_main_process and (step + 1) % 500 == 0:
                 if (step + 1) % 5000 == 0:
+                    pipe = unwrap(accelerator, pipe)
                     pipe.save_pretrained(f'{args.work_dir}/step_{step}/')
                     print(f"Saved model to directory {f'{args.work_dir}/step_{step}/'}")
                 elif (step + 1) % 1000 == 0:
+                    pipe = unwrap(accelerator, pipe)
                     pipe.save_pretrained(f'{args.work_dir}/current/')
 
                 batch = next(iter_val_loader)
