@@ -5,6 +5,8 @@ import torch
 import numpy as np
 from diffusers import StableDiffusion3Pipeline
 from unilatent import UniLatentPipeline
+# from transformer import SD3Transformer2DModel
+from diffusers import SD3Transformer2DModel
 
 from tqdm import tqdm
 from diffusers import get_cosine_schedule_with_warmup
@@ -16,7 +18,7 @@ from transformers import (
 )
 
 from caption_decoder_v1 import TextDecoder
-from utils import get_lr, get_suffix_ids, get_dataloader, unwrap, GradientFixer
+from utils import get_lr, get_suffix_ids, get_dataloader, unwrap, GradientFixer, LayerAggregator
 from utils import EmbedAdapterV1
 from utils import EmbedAdapterV2
 from utils import EmbedAdapterV3
@@ -34,6 +36,7 @@ parser.add_argument('--sample_and_exit', action='store_true')
 parser.add_argument('--mode', default='i2i')
 parser.add_argument('--pretrain_adapter', action='store_true')
 parser.add_argument('--debug', action='store_true')
+parser.add_argument('--dift_index', type=int, default=0)
 args = parser.parse_args()
 
 print("args mode", args.mode)
@@ -86,9 +89,9 @@ if not args.load_from:
     pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
     pipe.clip_image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
 
-    # transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
+    transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
     # transformer.load_state_dict(pipe.transformer.state_dict())
-    # pipe.transformer = transformer
+    pipe.transformer = transformer
 
     if args.adapter_version == 'v1':
         EmbedAdapter = EmbedAdapterV1
@@ -127,6 +130,16 @@ if not args.load_from:
 else:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 
+if args.dift_index and pipe.text_decoder.prefix_dim != 1536:
+    print("We need to re-initialize the decoder adapter.")
+    prefix_dim = pipe.text_decoder.prefix_dim
+    dift_image_encoder_adapter = EmbedAdapter(1536, prefix_dim, prefix_length, embed_pool=True, use_attn=True)
+    layer_aggregator = LayerAggregator(len(args.block_num))
+    pipe.register_modules(
+        dift_image_encoder_adapter=dift_image_encoder_adapter,
+        layer_aggregator=layer_aggregator
+    )
+
 val_loader = get_dataloader(args, val_config, val=True)
 
 if args.debug or not args.sample_and_exit:
@@ -139,7 +152,7 @@ num_steps = args.num_steps
 from_mode, to_mode = args.mode.split('2')
 print("MODES", from_mode, to_mode)
 if args.mode == 't2i':
-    models = [pipe.image_decoder_adapter]
+    models = [pipe.image_decoder_adapter, pipe.transformer]
     models2 = []
 elif args.mode == 'i2ti':
     models = [pipe.image_encoder_adapter, pipe.text_decoder, pipe.image_decoder_adapter]
@@ -155,6 +168,9 @@ elif args.mode == 'ti2ti':
         models2 = [pipe.text_encoder, pipe.text_encoder_2, pipe.clip_image_encoder]
 else:
     raise NotImplementedError
+
+if args.dift_index:
+    models.append(pipe.layer_aggregator)
 
 [x.train() for x in models if x is not None]
 [x.train() for x in models2 if x is not None]
@@ -208,11 +224,18 @@ pipe = prepare(pipe)
 def sample(batch):
     image, prompt = batch[0].to('cuda'), batch[1]
     with torch.no_grad():
-        prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt[:1])
-        image_embeds, pooled_image_embeds = pipe.encode_image(image[:1], dtype=torch.float16)
-        embeds = torch.cat([prompt_embeds, image_embeds])
-        pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds])
-        embeds = torch.cat([embeds, pooled_embeds], axis=1)
+        if args.dift_index:
+            embeds, pooled_embeds = pipe.encode_image(image[:2], dtype=torch.float16)
+            embeds, pooled_embeds = pipe.dift_features(
+                image[:2], index=args.dift_index, embed=embeds, pooled_embed=pooled_embeds,
+                return_layers=[6, 12, 18], dataset_conditioning=True
+                )
+        else:
+            prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt[:1])
+            image_embeds, pooled_image_embeds = pipe.encode_image(image[:1], dtype=torch.float16)
+            embeds = torch.cat([prompt_embeds, image_embeds])
+            pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds])
+            embeds = torch.cat([embeds, pooled_embeds], axis=1)
         suffix_input_ids = get_suffix_ids(batch, pipe.decoder_tokenizer, accelerator.device)
         decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
                             eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device,
@@ -275,6 +298,12 @@ else:
                 embeds, pooled_embeds = image_embeds, pooled_image_embeds
             elif 't' in from_mode:
                 embeds, pooled_embeds = prompt_embeds, pooled_prompt_embeds
+
+            if args.dift_index:
+                embeds, pooled_embeds = pipe.dift_features(
+                    image, index=args.dift_index, embed=embeds, pooled_embed=pooled_embeds,
+                    return_layers=[6, 12, 18], dataset_conditioning=True
+                    )
 
             if 'i' in to_mode:
                 model_output, target = pipe.embed_to_denoiser_v2(image, embeds, pooled_embeds)

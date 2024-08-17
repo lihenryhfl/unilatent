@@ -179,7 +179,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->text_decoder->clip_image_encoder->transformer->vae"
-    _optional_components = ['image_decoder_adapter', 'image_encoder_adapter', 'soft_prompter', 'layer_aggregator']
+    _optional_components = ['image_decoder_adapter', 'image_encoder_adapter', 'soft_prompter', 'layer_aggregator', 'dift_image_encoder_adapter']
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
 
     def __getattribute__(self, name):
@@ -207,6 +207,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         decoder_tokenizer: GPT2Tokenizer,
         image_decoder_adapter: EmbedAdapter = None,
         image_encoder_adapter: EmbedAdapter = None,
+        dift_image_encoder_adapter: EmbedAdapter = None,
         soft_prompter: SoftPrompter = None,
         layer_aggregator: LayerAggregator = None,
     ):
@@ -232,6 +233,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
             decoder_tokenizer=decoder_tokenizer,
             image_decoder_adapter=image_decoder_adapter,
             image_encoder_adapter=image_encoder_adapter,
+            dift_image_encoder_adapter=dift_image_encoder_adapter,
             soft_prompter=soft_prompter,
             layer_aggregator=layer_aggregator,
         )
@@ -1247,9 +1249,16 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         if self._hasattr('layer_aggregator'):
             hidden = self.layer_aggregator(hidden)
 
-        if self._hasattr('image_encoder_adapter') and not skip_adapter:
+        if self._hasattr('dift_image_encoder_adapter') and not skip_adapter:
             assert hidden is not None
-            hidden = self.image_encoder_adapter(hidden)
+            hidden = self.dift_image_encoder_adapter(hidden)
+        elif self._hasattr('image_encoder_adapter') and not skip_adapter:
+            print(
+                "Deprecated: Running image_encoder_adapter in the dift_features function in unilatent. ",
+                "Please convert to dift_image_encoder_adapter instead."
+            )
+            assert hidden is not None
+            hidden = self.dift_image_encoder_adapter(hidden)
 
         hidden = hidden[:, :prefix_length]
         
