@@ -6,7 +6,7 @@ import numpy as np
 from diffusers import StableDiffusion3Pipeline
 from unilatent import UniLatentPipeline
 # from transformer import SD3Transformer2DModel
-from diffusers import SD3Transformer2DModel
+# from diffusers import SD3Transformer2DModel
 
 from tqdm import tqdm
 from diffusers import get_cosine_schedule_with_warmup
@@ -37,6 +37,7 @@ parser.add_argument('--mode', default='i2i')
 parser.add_argument('--pretrain_adapter', action='store_true')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--dift_index', type=int, default=0)
+parser.add_argument('--save_every', type=int, default=10000)
 args = parser.parse_args()
 
 print("args mode", args.mode)
@@ -73,6 +74,20 @@ train_config = {
     'transform': 'default_train'
 }
 
+if args.adapter_version == 'v1':
+    EmbedAdapter = EmbedAdapterV1
+    adapter_len = -1
+elif args.adapter_version == 'v2':
+    EmbedAdapter = EmbedAdapterV2
+    adapter_len = -1
+elif args.adapter_version == 'v3':
+    EmbedAdapter = EmbedAdapterV3
+    adapter_len = 78
+elif not args.adapter_version:
+    EmbedAdapter = None
+else:
+    raise NotImplementedError
+
 if not args.load_from:
     pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float32)
 
@@ -89,23 +104,9 @@ if not args.load_from:
     pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
     pipe.clip_image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
 
-    transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
+    # transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
     # transformer.load_state_dict(pipe.transformer.state_dict())
-    pipe.transformer = transformer
-
-    if args.adapter_version == 'v1':
-        EmbedAdapter = EmbedAdapterV1
-        adapter_len = -1
-    elif args.adapter_version == 'v2':
-        EmbedAdapter = EmbedAdapterV2
-        adapter_len = -1
-    elif args.adapter_version == 'v3':
-        EmbedAdapter = EmbedAdapterV3
-        adapter_len = 78
-    elif not args.adapter_version:
-        EmbedAdapter = None
-    else:
-        raise NotImplementedError
+    # pipe.transformer = transformer
 
     image_encoder_adapter = image_decoder_adapter = None
     if args.adapter_version:
@@ -130,11 +131,21 @@ if not args.load_from:
 else:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 
-if args.dift_index and pipe.text_decoder.prefix_dim != 1536:
+# also re-initialize transformer
+from orig_transformer import SD3Transformer2DModel
+transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
+transformer.load_state_dict(pipe.transformer.state_dict())
+pipe.register_modules(
+    transformer=transformer
+)
+
+if args.dift_index and pipe.text_decoder.prefix_inner_dim != 1536:
     print("We need to re-initialize the decoder adapter.")
-    prefix_dim = pipe.text_decoder.prefix_dim
-    dift_image_encoder_adapter = EmbedAdapter(1536, prefix_dim, prefix_length, embed_pool=True, use_attn=True)
-    layer_aggregator = LayerAggregator(len(args.block_num))
+    prefix_dim = pipe.text_decoder.prefix_inner_dim
+    prefix_length = pipe.text_decoder.prefix_length
+    dift_blocks = [6, 12, 18]
+    dift_image_encoder_adapter = EmbedAdapter(1536, prefix_dim, prefix_length, embed_pool=False, use_attn=True)
+    layer_aggregator = LayerAggregator(len(dift_blocks))
     pipe.register_modules(
         dift_image_encoder_adapter=dift_image_encoder_adapter,
         layer_aggregator=layer_aggregator
@@ -154,6 +165,9 @@ print("MODES", from_mode, to_mode)
 if args.mode == 't2i':
     models = [pipe.image_decoder_adapter, pipe.transformer]
     models2 = []
+elif args.mode == 'i2t':
+    models = [pipe.text_decoder, pipe.image_encoder_adapter]
+    models2 = []
 elif args.mode == 'i2ti':
     models = [pipe.image_encoder_adapter, pipe.text_decoder, pipe.image_decoder_adapter]
     models2 = []
@@ -170,6 +184,7 @@ else:
     raise NotImplementedError
 
 if args.dift_index:
+    models.append(pipe.dift_image_encoder_adapter)
     models.append(pipe.layer_aggregator)
 
 [x.train() for x in models if x is not None]
@@ -226,17 +241,20 @@ def sample(batch):
     with torch.no_grad():
         if args.dift_index:
             embeds, pooled_embeds = pipe.encode_image(image[:2], dtype=torch.float16)
+            index = torch.full(size=(len(embeds),), fill_value=args.dift_index)
             embeds, pooled_embeds = pipe.dift_features(
-                image[:2], index=args.dift_index, embed=embeds, pooled_embed=pooled_embeds,
-                return_layers=[6, 12, 18], dataset_conditioning=True
+                image[:2], index=index, embed=embeds, pooled_embed=pooled_embeds,
+                return_layers=dift_blocks, dataset_conditioning=True
                 )
         else:
             prompt_embeds, pooled_prompt_embeds = pipe.encode_text(prompt[:1])
             image_embeds, pooled_image_embeds = pipe.encode_image(image[:1], dtype=torch.float16)
             embeds = torch.cat([prompt_embeds, image_embeds])
             pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds])
-            embeds = torch.cat([embeds, pooled_embeds], axis=1)
+        embeds = torch.cat([embeds, pooled_embeds], axis=1)
         suffix_input_ids = get_suffix_ids(batch, pipe.decoder_tokenizer, accelerator.device)
+        # suffix_input_ids = suffix_input_ids.tile(len(embeds), 1)
+        # print(suffix_input_ids.shape)
         decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
                             eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device,
                             suffix_input_ids=suffix_input_ids)[0]
@@ -250,7 +268,7 @@ if args.sample_and_exit:
     json_list = []
     progbar = tqdm(val_loader)
     for i, batch in enumerate(progbar):
-        decoded_text = sample(batch)[1]
+        decoded_text = sample(batch)[-1]
         
         caption = decoded_text.strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '').strip()
         image_id = batch[-1]['image_id'].item() if 'image_id' in batch[-1] else 0
@@ -300,9 +318,10 @@ else:
                 embeds, pooled_embeds = prompt_embeds, pooled_prompt_embeds
 
             if args.dift_index:
+                index = torch.full(size=(len(embeds),), fill_value=args.dift_index)
                 embeds, pooled_embeds = pipe.dift_features(
-                    image, index=args.dift_index, embed=embeds, pooled_embed=pooled_embeds,
-                    return_layers=[6, 12, 18], dataset_conditioning=True
+                    image, index=index, embed=embeds, pooled_embed=pooled_embeds,
+                    return_layers=dift_blocks, dataset_conditioning=True
                     )
 
             if 'i' in to_mode:
@@ -351,11 +370,11 @@ else:
             if accelerator.is_main_process and (step + 1) % 500 == 0:
                 [x.eval() for x in models if x is not None]
                 [x.eval() for x in models2 if x is not None]
-                if (step + 1) % 5000 == 0:
+                if (step + 1) % args.save_every == 0:
                     pipe = unwrap(accelerator, pipe)
                     pipe.save_pretrained(f'{args.work_dir}/step_{step}/')
                     print(f"Saved model to directory {f'{args.work_dir}/step_{step}/'}")
-                elif (step + 1) % 500 == 0:
+                elif (step + 1) % 1000 == 0:
                     pipe = unwrap(accelerator, pipe)
                     pipe.save_pretrained(f'{args.work_dir}/current/')
 
@@ -365,11 +384,10 @@ else:
                 if 't' in to_mode:
                     batch = next(iter_val_loader)
                     decoded_text = sample(batch)
-                    print(
-                        f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
-                        f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} \n"
-                        f"True: {batch[1][0]}"
-                    )
+                    print(f"Recon from text: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')}")
+                    if len(decoded_text) > 1:
+                        print(f"Recon from image: {decoded_text[1].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')}")
+                    print(f"True: {batch[1][0]}")
 
                 [x.train() for x in models if x is not None]
                 [x.train() for x in models2 if x is not None]

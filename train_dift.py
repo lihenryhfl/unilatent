@@ -20,7 +20,7 @@ from caption_decoder_v1 import TextDecoder
 from utils import LayerAggregator, GradientFixer, get_suffix_ids, get_dataloader, unwrap
 from utils import EmbedAdapterV1, EmbedAdapterV2, EmbedAdapterV3
 
-from transformer import SD3Transformer2DModel
+from orig_transformer import SD3Transformer2DModel
 
 parser = argparse.ArgumentParser(description="Training.")
 parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2text/', help='the dir to save logs and models')
@@ -133,13 +133,13 @@ else:
 
     soft_prompter = image_encoder_adapter = None
     if args.adapter_type == 'v1':
-        image_encoder_adapter = EmbedAdapterV1(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool)
+        dift_image_encoder_adapter = EmbedAdapterV1(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool)
     elif args.adapter_type == 'v2':
-        image_encoder_adapter = EmbedAdapterV2(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
+        dift_image_encoder_adapter = EmbedAdapterV2(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
     elif args.adapter_type == 'v3':
-        image_encoder_adapter = EmbedAdapterV3(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
+        dift_image_encoder_adapter = EmbedAdapterV3(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
     elif not args.adapter_type or args.adapter_type == 'none':
-        image_encoder_adapter = None
+        dift_image_encoder_adapter = None
         
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
@@ -153,10 +153,18 @@ else:
         clip_image_processor=pipe.clip_image_processor,
         text_decoder=pipe.text_decoder,
         decoder_tokenizer=pipe.decoder_tokenizer,
-        image_encoder_adapter=image_encoder_adapter,
+        dift_image_encoder_adapter=dift_image_encoder_adapter,
         soft_prompter=soft_prompter,
         layer_aggregator=layer_aggregator
     )
+
+# also re-initialize transformer
+from orig_transformer import SD3Transformer2DModel
+transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
+transformer.load_state_dict(pipe.transformer.state_dict())
+pipe.register_modules(
+    transformer=transformer
+)
 
 if args.layer_aggregator:
     layer_logits = pipe.layer_aggregator.layer_logits
@@ -226,11 +234,6 @@ pipe = pipe.to(accelerator.device)
     pipe.image_encoder_adapter,
     pipe.soft_prompter,
 )
-
-if args.pretrain:
-    pipe.wrapped_text_decoder = FrozenDecoderTrainableDataTokenWrapper(pipe.text_decoder)
-else:
-    pipe.wrapped_text_decoder = pipe.text_decoder
 
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:

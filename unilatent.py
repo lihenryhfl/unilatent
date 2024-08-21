@@ -1116,16 +1116,17 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         
         return sigma
 
-    def embed_to_denoiser_v2(self, image, embeds, pooled_embeds):
+    def embed_to_denoiser_v2(self, image, embeds, pooled_embeds, indices=None, return_layers=None):
         latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
         latent = (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
         noise = torch.randn_like(latent)
         # Sample a random timestep for each image
         # for weighting schemes where we sample timesteps non-uniformly
-        u = torch.normal(mean=0., std=1., size=(len(latent),), device="cpu")
-        u = torch.nn.functional.sigmoid(u)
-        indices = (u * self.scheduler.config.num_train_timesteps).long()
+        if indices is None:
+            u = torch.normal(mean=0., std=1., size=(len(latent),), device="cpu")
+            u = torch.nn.functional.sigmoid(u)
+            indices = (u * self.scheduler.config.num_train_timesteps).long()
         timesteps = self.scheduler.timesteps[indices].to(device=latent.device)
 
         # Add noise according to flow matching.
@@ -1149,7 +1150,13 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
                     encoder_hidden_states=embeds,
                     pooled_projections=pooled_embeds,
                     joint_attention_kwargs=None,
+                    return_layers=return_layers
                 )
+
+        if return_layers is not None:
+            assert len(return_layers) > 0
+            assert isinstance(model_output.hidden, tuple), f"{type(model_output)}, {type(model_output.hidden)}"
+            return model_output.hidden, target
 
         return model_output.sample, target
 
@@ -1174,7 +1181,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
                     encoder_hidden_states=prompt_embeds,
                     pooled_projections=pooled_prompt_embeds,
                     joint_attention_kwargs=None,
-                    return_layers=return_layers
+                    # return_layers=return_layers
                 )
 
         if return_layers:
@@ -1228,7 +1235,7 @@ class UniLatentPipeline(DiffusionPipeline, FromSingleFileMixin):
         
         hidden_list = []
         for i in range(num_aggregation_steps):
-            (_, hidden), _ = self.embed_to_denoiser(
+            (_, hidden), _ = self.embed_to_denoiser_v2(
                 image,
                 embed, 
                 pooled_embed,
