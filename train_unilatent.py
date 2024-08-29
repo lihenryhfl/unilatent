@@ -29,7 +29,7 @@ parser.add_argument('--load_from', default='', help='the dir to load from')
 parser.add_argument('--adapter_version', default='', help='version of the pre-decoder / pre-denoiser adapter')
 parser.add_argument('--batch_size', type=int, default=48)
 parser.add_argument('--step_offset', type=int, default=0)
-parser.add_argument('--num_steps', type=int, default=100_000)
+parser.add_argument('--n_steps', type=int, default=100_000)
 parser.add_argument('--lam', type=float, default=1.)
 parser.add_argument('--lr', type=float, default=1e-5)
 parser.add_argument('--sample_and_exit', action='store_true')
@@ -110,7 +110,7 @@ if not args.load_from:
 
     image_encoder_adapter = image_decoder_adapter = None
     if args.adapter_version:
-        image_encoder_adapter = EmbedAdapter(1024, 2048, prefix_length, embed_pool=True, use_attn=True)
+        image_encoder_adapter = EmbedAdapter(1024, 2048, prefix_length - 1, embed_pool=True, use_attn=True)
         image_decoder_adapter = EmbedAdapter(2048, 2048, adapter_len, embed_pool=True, use_attn=True)
 
     pipe = UniLatentPipeline(
@@ -158,7 +158,7 @@ if args.debug or not args.sample_and_exit:
 else:
     dataloader = val_loader
 
-num_steps = args.num_steps
+num_steps = args.n_steps
 
 from_mode, to_mode = args.mode.split('2')
 print("MODES", from_mode, to_mode)

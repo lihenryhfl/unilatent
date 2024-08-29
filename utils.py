@@ -196,34 +196,11 @@ class MultiHeadSelfAttention(nn.Module):
 
         return x
 
-# class AttentionLayerAggregator(ModelMixin, ConfigMixin, ModuleUtilsMixin):
-#     @register_to_config
-#     def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16, embed_pool=False):
-#         super().__init__()
-        
-
-#     def forward(self, layers):
-#         x = torch.stack(layers, axis=2)
-#         B, N, L, C = x.shape # batch_size, n_positions, num_layers, n_channels
-#         print(f"SHAPES: {B}, {N}, {L}. {C}")
-        
-#         # combine the batch and position dimensions
-#         x = x.view(B * N, L, C)
-
-#         x = self.attn(x)
-
-#         # uncombine
-#         x = x.reshape(B, N, C)
-
-#         return x
-
 class LayerAggregator(ModelMixin, ConfigMixin, ModuleUtilsMixin):
     @register_to_config
     def __init__(self, n_layers):
         super().__init__()
         self.n_layers = n_layers
-        # self.register_parameter("layer_logits", torch.zeros(n_layers))
-        # self.layer_logits = torch.nn.Parameter(torch.zeros(n_layers))
         self.layer_logits = torch.nn.Parameter(torch.randn(n_layers) * 0.01)
         self.softmax = nn.Softmax(dim=0)
 
@@ -233,6 +210,37 @@ class LayerAggregator(ModelMixin, ConfigMixin, ModuleUtilsMixin):
         C = C_prime // self.n_layers
         # split on channel dimension to regain layers
         layers = layers.reshape(B, N, self.n_layers, C)
+        layer_gates = self.softmax(self.layer_logits).reshape(self.n_layers, 1)
+        x = layers * layer_gates
+        x = x.sum(axis=-2)
+
+        return x
+
+class AttentionLayerAggregator(LayerAggregator):
+    @register_to_config
+    def __init__(self, n_layers, prefix_dim):
+        super().__init__(n_layers)
+        self.adapters = nn.ModuleList([
+            EmbedAdapterV3(prefix_dim, prefix_dim, -1, embed_pool=False, use_attn=True) for _ in range(n_layers)
+        ])
+
+    def forward(self, layers):
+        B, N, C_prime = layers.shape
+        assert C_prime % self.n_layers == 0
+        C = C_prime // self.n_layers
+
+        # split on channel dimension to regain layers
+        layers = layers.reshape(B, N, self.n_layers, C)
+
+        new_layers = []
+        for i in range(self.n_layers):
+            layer = layers[..., i, :]
+            layer = self.adapters[i](layer)
+            new_layers.append(layer)
+
+        layers = torch.stack(new_layers, axis=-2)
+        assert layers.shape == (B, N, self.n_layers, C), f"{layers.shape}, {(B, N, self.n_layers, C)}"
+
         layer_gates = self.softmax(self.layer_logits).reshape(self.n_layers, 1)
         x = layers * layer_gates
         x = x.sum(axis=-2)
@@ -372,12 +380,14 @@ class EmbedAdapterV2(EmbedAdapter):
         self.output_dim = output_dim
         self.output_length = output_length
         self.embed_pool = embed_pool
-        assert output_length == -1
 
         self.redimension = ReDimension(input_dim, output_dim)
         attn = BasicTransformerBlock(output_dim, n_heads, output_dim // n_heads, dropout=dropout)
         self.attn = attn
         self.add_module('attn', attn)
+
+        if output_length > -1:
+            self.relength = ReLength(output_length, output_dim, n_heads)
 
     def forward(self, x, x_pooled=None):
         if self.embed_pool:
@@ -390,10 +400,14 @@ class EmbedAdapterV2(EmbedAdapter):
 
         if self.embed_pool:
             x, x_pooled = x[:, :-1], x[:, -1:]
-            return x, x_pooled
+            
+        if hasattr(self, 'relength'):
+            x = self.relength(x)
         
-        return x
-
+        if self.embed_pool:
+            return x, x_pooled
+        else:
+            return x
 
 class EmbedAdapterV3(EmbedAdapter):
     @register_to_config
@@ -420,68 +434,37 @@ class EmbedAdapterV3(EmbedAdapter):
         x = self.redimension(x)
 
         if hasattr(self, 'attn'):
-            x = x + self.attn(x)
-
-        if hasattr(self, 'relength'):
-            x = self.relength(x)
+            x = self.attn(x)
 
         if self.embed_pool:
             x, x_pooled = x[:, :-1], x[:, -1:]
+            
+        if hasattr(self, 'relength'):
+            x = self.relength(x)
+        
+        if self.embed_pool:
             return x, x_pooled
-        
-        return x
-        
-
-class AdapterConfig(PretrainedConfig):
-
-    # model_type = "adapter"
-    # keys_to_ignore_at_inference = ["past_key_values"]
-    # attribute_map = {
-    #     "hidden_size": "n_embd",
-    #     "max_position_embeddings": "n_positions",
-    #     "num_attention_heads": "n_head",
-    #     "num_hidden_layers": "n_layer",
-    # }
-
-    def __init__(
-        self,
-        input_dim, 
-        output_dim, 
-        output_length=-1, 
-        n_heads=16
-    ):
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.output_length = output_length
-        self.n_heads = n_heads
-
-        super().__init__()
+        else:
+            return x
 
 
 class SoftPrompter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
     @register_to_config
-    def __init__(self, d_model, length=1, std=0.):
+    def __init__(self, d_model, d_pooled=None, length=1, std=0.):
         super().__init__()
+        if d_pooled is None:
+            d_pooled = d_model
         self.register_buffer('soft_prompt', torch.randn(size=(1, length, d_model)) * std)
-        self.register_buffer('pooled_soft_prompt', torch.randn(size=(1, 1, d_model)) * std)
+        self.register_buffer('pooled_soft_prompt', torch.randn(size=(1, 1, d_pooled)) * std)
 
     def forward(self, x, x_pooled):
-        return x + self.soft_prompt, x_pooled + self.pooled_soft_prompt
+        B, N, C = x.shape
+        _, _, _ = x_pooled.shape
+        assert C == self.soft_prompt.shape[-1], f"{C.shape}, {self.soft_prompt.shape}"
+        new_x = self.soft_prompt.tile(B, 1, 1)
+        new_x_pooled = self.pooled_soft_prompt.tile(B, 1, 1)
+        return new_x, new_x_pooled
         
-
-class SoftPrompterConfig(PretrainedConfig):
-
-    def __init__(
-        self,
-        d_model, 
-        length=1,
-        n_heads=16
-    ):
-        self.d_model = d_model
-        self.length = length
-        self.n_heads = n_heads
-
-        super().__init__()
 
 def generate_captions(pipe, dataloader, save_path, sampler, sampler_kwargs={}):
     json_list = []

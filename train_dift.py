@@ -15,9 +15,9 @@ from transformers import (
     CLIPImageProcessor,
 )
 
-# from caption_decoder import TextDecoder
+from caption_decoder import TextDecoder as TextDecoderV0
 from caption_decoder_v1 import TextDecoder
-from utils import LayerAggregator, GradientFixer, get_suffix_ids, get_dataloader, unwrap
+from utils import AttentionLayerAggregator, LayerAggregator, GradientFixer, SoftPrompter, get_suffix_ids, get_dataloader, unwrap
 from utils import EmbedAdapterV1, EmbedAdapterV2, EmbedAdapterV3
 
 from orig_transformer import SD3Transformer2DModel
@@ -39,8 +39,11 @@ parser.add_argument('--clip', action='store_true')
 parser.add_argument('--clip_text', action='store_true')
 parser.add_argument('--adapter_type', default='')
 parser.add_argument('--pretrain', action='store_true')
-parser.add_argument('--layer_aggregator', action='store_true')
+parser.add_argument('--layer_aggregator', type=str, default='attention')
 parser.add_argument('--pretrain_adapter', action='store_true')
+parser.add_argument('--soft_prompter', action='store_true')
+parser.add_argument('--flux', action='store_true')
+parser.add_argument('--textv0', action='store_true')
 args = parser.parse_args()
 
 assert not (args.clip_text and args.clip)
@@ -80,10 +83,22 @@ train_config = {
     'transform': 'default_train'
 }
 
+if args.flux:
+    from unilatent_flux import UniLatentFluxPipeline as UniLatentPipeline
+    from diffusers import FluxPipeline as OrigPipeline
+    from transformer_flux import FluxTransformer2DModel as TransformerClass
+    orig_path = "black-forest-labs/FLUX.1-schnell"
+    model_dim = 3072
+else:
+    OrigPipeline = StableDiffusion3Pipeline
+    TransformerClass = SD3Transformer2DModel
+    orig_path = "stabilityai/stable-diffusion-3-medium-diffusers"
+    model_dim = 1536
+
 if args.load_from:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 else:
-    pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float32)
+    pipe = OrigPipeline.from_pretrained(orig_path, torch_dtype=torch.float32)
     decoder_tokenizer = GPT2Tokenizer.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt_tokenizer/')
     decoder_tokenizer.add_special_tokens({'pad_token': decoder_tokenizer.eos_token})
     decoder_tokenizer.add_tokens([f'<|dataset{i}|>' for i in range(len(train_config['roots']))])
@@ -101,22 +116,21 @@ else:
         print("USING IMAGE SIZE", args.image_size)
         prefix_length = int(args.image_size ** 2 / 16 ** 2)
 
-    layer_aggregator = None
-    if args.layer_aggregator:
-        layer_aggregator = LayerAggregator(len(args.block_num))
-
     if args.clip:
         prefix_length = 259
         prefix_dim = 1024
         embed_pool = True
     elif args.clip_text:
         prefix_length += 1
-        prefix_dim = 1536
+        prefix_dim = model_dim
         embed_pool = False
     else:
         prefix_length += 1
-        prefix_dim = 1536
+        prefix_dim = model_dim
         embed_pool = False
+
+    if args.textv0:
+        TextDecoder = TextDecoderV0
 
     text_decoder = TextDecoder(
         prefix_length=prefix_length,
@@ -127,7 +141,7 @@ else:
     pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
     pipe.clip_image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
 
-    transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
+    transformer = TransformerClass.from_config(pipe.transformer.config)
     transformer.load_state_dict(pipe.transformer.state_dict())
     pipe.transformer = transformer
 
@@ -140,6 +154,18 @@ else:
         dift_image_encoder_adapter = EmbedAdapterV3(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
     elif not args.adapter_type or args.adapter_type == 'none':
         dift_image_encoder_adapter = None
+
+    layer_aggregator = None
+    if args.layer_aggregator == 'attention':
+        layer_aggregator = AttentionLayerAggregator(len(args.block_num), prefix_dim)
+    elif args.layer_aggregator == 'no_attention':
+        layer_aggregator = LayerAggregator(len(args.block_num))
+    else:
+        print(f"Not recognized: {args.layer_aggregator}")
+        raise NotImplementedError
+
+    if args.soft_prompter:
+        soft_prompter = SoftPrompter(2048, 33)
         
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
@@ -159,8 +185,7 @@ else:
     )
 
 # also re-initialize transformer
-from orig_transformer import SD3Transformer2DModel
-transformer = SD3Transformer2DModel.from_config(pipe.transformer.config)
+transformer = TransformerClass.from_config(pipe.transformer.config)
 transformer.load_state_dict(pipe.transformer.state_dict())
 pipe.register_modules(
     transformer=transformer
@@ -189,8 +214,13 @@ if args.clip_text:
 if args.layer_aggregator:
     models.append(pipe.layer_aggregator)
 
+if args.soft_prompter:
+    models.append(pipe.soft_prompter)
+
+lr = 2e-3 if args.pretrain_adapter else 2e-5
+
 num_steps = args.n_steps
-optimizer = torch.optim.AdamW(lr=2e-5, params=pipe.parameters(models=models))
+optimizer = torch.optim.AdamW(lr=lr, params=pipe.parameters(models=models))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=2000 + args.step_offset,
@@ -222,6 +252,7 @@ pipe = pipe.to(accelerator.device)
     pipe.vae,
     pipe.image_encoder_adapter,
     pipe.soft_prompter,
+    pipe.dift_image_encoder_adapter
 ) = accelerator.prepare(
     optimizer, 
     lr_scheduler,
@@ -233,6 +264,7 @@ pipe = pipe.to(accelerator.device)
     pipe.vae,
     pipe.image_encoder_adapter,
     pipe.soft_prompter,
+    pipe.dift_image_encoder_adapter
 )
 
 def get_lr(optimizer):
@@ -273,7 +305,6 @@ if args.sample_and_exit:
     print("Saving to", save_path)
     json_list = []
     progbar = tqdm(val_loader)
-    # progbar = tqdm(dataloader)
     for i, batch in enumerate(progbar):
         decoded_text = sample(batch)[0]
         
