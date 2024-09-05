@@ -6,6 +6,7 @@ import torch
 from diffusers import StableDiffusion3Pipeline
 from unilatent import UniLatentPipeline
 
+import wandb
 from tqdm import tqdm
 from diffusers import get_cosine_schedule_with_warmup
 from accelerate import Accelerator
@@ -22,6 +23,8 @@ from utils import EmbedAdapterV1, EmbedAdapterV2, EmbedAdapterV3
 
 from orig_transformer import SD3Transformer2DModel
 
+wandb.login()
+
 parser = argparse.ArgumentParser(description="Training.")
 parser.add_argument('--work_dir', default='/mnt/bn/us-aigc-temp/henry/data/clip2text/', help='the dir to save logs and models')
 parser.add_argument('--load_from', default='', help='the dir to load logs and models')
@@ -33,11 +36,13 @@ parser.add_argument('--block_num', nargs='+', type=int, default='12')
 parser.add_argument('--image_size', type=int, default=-1)
 parser.add_argument('--step_offset', type=int, default=0)
 parser.add_argument('--n_steps', type=int, default=200_000)
+parser.add_argument('--lr', type=float, default=2e-5)
 parser.add_argument('--sample_and_exit', action='store_true')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--clip', action='store_true')
 parser.add_argument('--clip_text', action='store_true')
 parser.add_argument('--adapter_type', default='')
+parser.add_argument('--wandb_project', default='dift')
 parser.add_argument('--pretrain', action='store_true')
 parser.add_argument('--layer_aggregator', type=str, default='attention')
 parser.add_argument('--pretrain_adapter', action='store_true')
@@ -152,7 +157,7 @@ else:
         dift_image_encoder_adapter = EmbedAdapterV2(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
     elif args.adapter_type == 'v3':
         dift_image_encoder_adapter = EmbedAdapterV3(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
-    elif not args.adapter_type or args.adapter_type == 'none':
+    elif not args.adapter_type or args.adapter_type == 'none' or args.adapter_type == 'v0':
         dift_image_encoder_adapter = None
 
     layer_aggregator = None
@@ -217,7 +222,7 @@ if args.layer_aggregator:
 if args.soft_prompter:
     models.append(pipe.soft_prompter)
 
-lr = 2e-3 if args.pretrain_adapter else 2e-5
+lr = args.lr
 
 num_steps = args.n_steps
 optimizer = torch.optim.AdamW(lr=lr, params=pipe.parameters(models=models))
@@ -272,6 +277,27 @@ def get_lr(optimizer):
         return param_group['lr']
 
 print(f"TOTAL TRANSFORMER LAYERS: {len(pipe.transformer.transformer_blocks)} | OUR CHOSEN BLOCK: {args.block_num}")
+
+if accelerator.is_main_process:
+    if args.clip:
+        mode = "clip"
+    else:
+        mode = "dift"
+
+    if args.pretrain_adapter:
+        mode = mode + "_pretrain"
+
+    run = wandb.init(
+        # Set the project where this run will be logged
+        project=args.wandb_project,
+        # Track hyperparameters and run metadata
+        config={
+            "learning_rate": lr,
+            "iterations": num_steps,
+            "mode": mode
+        },
+    )
+    text_table = wandb.Table(columns=["iter", "loss", "text"])
 
 def sample(batch):
     with torch.no_grad():
@@ -363,12 +389,14 @@ else:
             optimizer.step()
             lr_scheduler.step()
             
+            if accelerator.is_main_process:
+                wandb.log({"loss": accelerator.gather(loss).detach().cpu().mean()}, step=step)
             losses.append(accelerator.gather(loss).detach().cpu())
             assert losses
             progbar.set_description(f"loss: {torch.stack(losses).mean().item():.3f}, lr: {get_lr(optimizer)}")
 
             if accelerator.is_main_process and (step + 1) % 500 == 0:
-                if (step + 1) % 5000 == 0:
+                if (step + 1) % 10000 == 0:
                     pipe = unwrap(accelerator, pipe)
                     pipe.save_pretrained(f'{args.work_dir}/step_{step}/')
                     print(f"Saved model to directory {f'{args.work_dir}/step_{step}/'}")
@@ -387,6 +415,10 @@ else:
                     print(f"Layer logits: {layer_logits}")
 
                 losses = []
+                if accelerator.is_main_process:
+                    text_table.add_data(step, loss, decoded_text[0]) 
             
             step += 1
     
+if accelerator.is_main_process:
+    run.log({"training_samples" : text_table})

@@ -31,11 +31,12 @@ parser.add_argument('--batch_size', type=int, default=48)
 parser.add_argument('--step_offset', type=int, default=0)
 parser.add_argument('--n_steps', type=int, default=100_000)
 parser.add_argument('--lam', type=float, default=1.)
-parser.add_argument('--lr', type=float, default=1e-5)
+parser.add_argument('--lr', type=float, default=2e-4)
 parser.add_argument('--sample_and_exit', action='store_true')
 parser.add_argument('--mode', default='i2i')
 parser.add_argument('--pretrain_adapter', action='store_true')
 parser.add_argument('--debug', action='store_true')
+parser.add_argument('--train_transformer', action='store_true')
 parser.add_argument('--dift_index', type=int, default=0)
 parser.add_argument('--save_every', type=int, default=10000)
 args = parser.parse_args()
@@ -169,8 +170,8 @@ elif args.mode == 'i2t':
     models = [pipe.text_decoder, pipe.image_encoder_adapter]
     models2 = []
 elif args.mode == 'i2ti':
-    models = [pipe.image_encoder_adapter, pipe.text_decoder, pipe.image_decoder_adapter]
-    models2 = []
+    models = [pipe.image_encoder_adapter, pipe.image_decoder_adapter]
+    models2 = [pipe.text_decoder]
 elif args.mode == 'i2i':
     models = [pipe.image_encoder_adapter]
     models2 = []
@@ -183,6 +184,9 @@ elif args.mode == 'ti2ti':
 else:
     raise NotImplementedError
 
+if args.train_transformer:
+    models2.append(pipe.transformer)
+
 if args.dift_index:
     models.append(pipe.dift_image_encoder_adapter)
     models.append(pipe.layer_aggregator)
@@ -191,7 +195,7 @@ if args.dift_index:
 [x.train() for x in models2 if x is not None]
 
 optimizer = torch.optim.AdamW(lr=args.lr, params=pipe.parameters(models=models))
-optimizer.add_param_group(dict(params=pipe.parameters(models=models2), lr=1e-2 * args.lr))
+optimizer.add_param_group(dict(params=pipe.parameters(models=models2), lr=2e-5))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=10000 + args.step_offset,
@@ -205,7 +209,6 @@ for p in pipe.parameters(models=models + models2):
     p.requires_grad = True
 
 accelerator = Accelerator(
-        # mixed_precision='fp16',
         mixed_precision='bf16',
     )
 
@@ -253,8 +256,7 @@ def sample(batch):
             pooled_embeds = torch.cat([pooled_prompt_embeds, pooled_image_embeds])
         embeds = torch.cat([embeds, pooled_embeds], axis=1)
         suffix_input_ids = get_suffix_ids(batch, pipe.decoder_tokenizer, accelerator.device)
-        # suffix_input_ids = suffix_input_ids.tile(len(embeds), 1)
-        # print(suffix_input_ids.shape)
+        
         decoded_tokens = pipe.text_decoder.generate_captions(embeds, 
                             eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device,
                             suffix_input_ids=suffix_input_ids)[0]
