@@ -14,6 +14,7 @@ from transformers import (
     GPT2Tokenizer,
     CLIPVisionModel,
     CLIPImageProcessor,
+    AutoModelForCausalLM,
 )
 
 from caption_decoder import TextDecoder as TextDecoderV0
@@ -43,6 +44,7 @@ parser.add_argument('--clip', action='store_true')
 parser.add_argument('--clip_text', action='store_true')
 parser.add_argument('--adapter_type', default='')
 parser.add_argument('--wandb_project', default='dift')
+parser.add_argument('--mode_suffix', default='')
 parser.add_argument('--pretrain', action='store_true')
 parser.add_argument('--layer_aggregator', type=str, default='attention')
 parser.add_argument('--pretrain_adapter', action='store_true')
@@ -104,8 +106,8 @@ if args.load_from:
     pipe = UniLatentPipeline.from_pretrained(args.load_from, torch_dtype=torch.float32)
 else:
     pipe = OrigPipeline.from_pretrained(orig_path, torch_dtype=torch.float32)
-    decoder_tokenizer = GPT2Tokenizer.from_pretrained('/mnt/bn/us-aigc-temp/henry/unilatent_weights/gpt_tokenizer/')
-    decoder_tokenizer.add_special_tokens({'pad_token': decoder_tokenizer.eos_token})
+    decoder_tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    decoder_tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
     decoder_tokenizer.add_tokens([f'<|dataset{i}|>' for i in range(len(train_config['roots']))])
     pipe.decoder_tokenizer = decoder_tokenizer
 
@@ -136,11 +138,15 @@ else:
 
     if args.textv0:
         TextDecoder = TextDecoderV0
+        prefix_hidden_dim = 4096
+    else:
+        prefix_hidden_dim = None
 
     text_decoder = TextDecoder(
         prefix_length=prefix_length,
         prefix_inner_dim=prefix_dim,
-        vocab_size=len(decoder_tokenizer) + len(decoder_tokenizer.get_added_vocab()))
+        prefix_hidden_dim=prefix_hidden_dim,
+        vocab_size=len(decoder_tokenizer))
     pipe.text_decoder = text_decoder
 
     pipe.clip_image_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
@@ -278,7 +284,7 @@ def get_lr(optimizer):
 
 print(f"TOTAL TRANSFORMER LAYERS: {len(pipe.transformer.transformer_blocks)} | OUR CHOSEN BLOCK: {args.block_num}")
 
-if accelerator.is_main_process:
+if accelerator.is_main_process and not args.sample_and_exit:
     if args.clip:
         mode = "clip"
     else:
@@ -286,6 +292,8 @@ if accelerator.is_main_process:
 
     if args.pretrain_adapter:
         mode = mode + "_pretrain"
+
+    mode = mode + args.mode_suffix
 
     run = wandb.init(
         # Set the project where this run will be logged
@@ -321,6 +329,7 @@ def sample(batch):
                             eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device,
                             suffix_input_ids=suffix_input_ids
                             )[0]
+        print("DECODED TOKENS", decoded_tokens)
         decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
     return decoded_text
 

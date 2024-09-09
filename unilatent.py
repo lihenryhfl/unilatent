@@ -390,19 +390,13 @@ class UniLatentPipeline(StableDiffusion3Pipeline):
 
     def embed_to_decoder(self, embed, pooled_embed, prompt, suffix_input_ids=None):
         B, N, C = embed.shape
-        joint_embed = torch.cat([embed, pooled_embed.reshape(B, 1, C)], axis=1)
+        joint_embed = torch.cat([embed, pooled_embed], axis=1)
 
-        processed_prompt = [self.decoder_tokenizer.bos_token + txt + self.decoder_tokenizer.eos_token for txt in prompt]
-        tokens = self.decoder_tokenizer(processed_prompt, return_tensors='pt', truncation=True,
-                                     max_length=120, padding="longest")
-        input_mask = tokens['attention_mask']
+        processed_prompt = [txt + self.decoder_tokenizer.eos_token for txt in prompt]
+        tokens = self.decoder_tokenizer(processed_prompt, return_tensors='pt', truncation=True, max_length=150, padding="longest")
+        input_mask = tokens['attention_mask'].to(self.device)
         input_ids = tokens['input_ids'].to(self.device)
-
-        target_len = input_ids.shape[1] + joint_embed.shape[1]
-        if suffix_input_ids is not None:
-            target_len += 1 
-
-        # assert target_len == mask.shape[1], f"{input_ids.shape}, {mask.shape}, {joint_embed.shape}, {suffix_input_ids is None}, {target_len}"
+        
         assert input_ids.max() < self.text_decoder.transformer.transformer.wte.weight.shape[0], f"{input_ids.max()}, {self.text_decoder.transformer.transformer.wte.weight.shape}"
         llm_out = self.text_decoder(input_ids, joint_embed, attention_mask=input_mask, suffix_input_ids=suffix_input_ids)
 
@@ -810,8 +804,6 @@ class UniLatentPipeline(StableDiffusion3Pipeline):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
                 assert self.joint_attention_kwargs is None
-
-                print("IN __call__", prompt_embeds.shape, pooled_prompt_embeds.shape, latent_model_input.shape, timestep.shape)
 
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,

@@ -331,7 +331,7 @@ class EmbedAdapter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
 class EmbedAdapterV1(EmbedAdapter):
     @register_to_config
     def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16, use_redimension=True,
-                 use_attn=False, embed_pool=False, attn_drop=0., proj_drop=0.):
+                 embed_pool=False):
         super().__init__(input_dim=input_dim, output_dim=output_dim, output_length=output_length)
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -342,23 +342,10 @@ class EmbedAdapterV1(EmbedAdapter):
             if embed_pool:
                 self.pooled_redimension = ReDimension(input_dim, output_dim)
 
-        if use_attn:
-            self.attn = MultiHeadSelfAttention(input_dim, n_heads, attn_drop=attn_drop, proj_drop=proj_drop)
-            nn.init.constant_(self.attn.proj.weight, 0)
-            nn.init.constant_(self.attn.proj.bias, 0)
-
         if output_length > -1:
             self.relength = ReLength(output_length, output_dim, n_heads)
             
     def forward(self, x, x_pooled=None):
-        if hasattr(self, 'attn'):
-            if self.embed_pool:
-                x_combined = torch.cat([x, x_pooled], axis=1)
-                x_combined = x_combined + self.attn(x_combined)
-                x, x_pooled = x_combined[:, :-1], x_combined[:, -1:]
-            else:
-                x = x + self.attn(x)
-        
         if hasattr(self, 'redimension'):
             x = self.redimension(x)
 
@@ -450,12 +437,10 @@ class EmbedAdapterV3(EmbedAdapter):
 
 class SoftPrompter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
     @register_to_config
-    def __init__(self, d_model, d_pooled=None, length=1, std=0.):
+    def __init__(self, d_model, length=1, std=0.):
         super().__init__()
-        if d_pooled is None:
-            d_pooled = d_model
         self.register_buffer('soft_prompt', torch.randn(size=(1, length, d_model)) * std)
-        self.register_buffer('pooled_soft_prompt', torch.randn(size=(1, 1, d_pooled)) * std)
+        self.register_buffer('pooled_soft_prompt', torch.randn(size=(1, 1, d_model)) * std)
 
     def forward(self, x, x_pooled):
         B, N, C = x.shape
