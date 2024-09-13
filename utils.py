@@ -16,6 +16,27 @@ from data.builder import build_dataset, build_dataloader
 from aspect_ratio_sampler import AspectRatioBatchSampler
 from torch.utils.data import RandomSampler
 
+import os
+import subprocess
+
+def get_metrics(fname):
+    MP = int(os.environ.get('MASTER_PORT', '29900'))
+    command = f"MASTER_PORT={MP+1} cd /mnt/bn/us-aigc-temp/henry/clipscore/; bash run_clipscore.sh {fname}"
+    print("RUNNING COMMAND", command)
+    output = subprocess.run(command, shell=True, capture_output=True).stdout.decode("utf-8")
+    metric_names = ['bleu-1', 'bleu-2', 'bleu-3', 'bleu-4', 'meteor', 'rouge', 'cider', 'clipscore']
+    
+    return_dict = {}
+    for line in output.split('\n'):
+        for metric_name in metric_names:
+            metric_name = metric_name.lower()
+            if metric_name in line.lower() and line.lower() != 'refclipscore':
+                return_dict[metric_name] = float(line.split(': ')[1])
+
+    assert len(return_dict) == len(metric_names), f"ERROR! return_dict: {return_dict} \n output: {output}"
+
+    return return_dict
+
 def unwrap(accelerator, pipe):
     pipe.transformer = accelerator.unwrap_model(pipe.transformer)
     pipe.text_encoder = accelerator.unwrap_model(pipe.text_encoder)

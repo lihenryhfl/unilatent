@@ -1,4 +1,5 @@
 from multiprocessing.connection import Pipe
+from pathlib import Path
 import os
 import json
 import argparse
@@ -19,7 +20,7 @@ from transformers import (
 
 from caption_decoder import TextDecoder as TextDecoderV0
 from caption_decoder_v1 import TextDecoder
-from utils import AttentionLayerAggregator, LayerAggregator, GradientFixer, SoftPrompter, get_suffix_ids, get_dataloader, unwrap
+from utils import AttentionLayerAggregator, LayerAggregator, GradientFixer, SoftPrompter, get_suffix_ids, get_dataloader, unwrap, get_metrics
 from utils import EmbedAdapterV1, EmbedAdapterV2, EmbedAdapterV3
 
 from orig_transformer import SD3Transformer2DModel
@@ -43,7 +44,7 @@ parser.add_argument('--debug', action='store_true')
 parser.add_argument('--clip', action='store_true')
 parser.add_argument('--clip_text', action='store_true')
 parser.add_argument('--adapter_type', default='')
-parser.add_argument('--wandb_project', default='dift')
+parser.add_argument('--wandb_project', default='dift_v1')
 parser.add_argument('--mode_suffix', default='')
 parser.add_argument('--pretrain', action='store_true')
 parser.add_argument('--layer_aggregator', type=str, default='attention')
@@ -54,6 +55,8 @@ parser.add_argument('--textv0', action='store_true')
 args = parser.parse_args()
 
 assert not (args.clip_text and args.clip)
+
+Path(args.work_dir).mkdir(parents=True, exist_ok=True)
 
 args.block_num = [args.block_num] if not isinstance(args.block_num, list) else args.block_num
 print("BLOCK NUM", args.block_num)
@@ -302,12 +305,13 @@ if accelerator.is_main_process and not args.sample_and_exit:
         config={
             "learning_rate": lr,
             "iterations": num_steps,
-            "mode": mode
+            "mode": mode,
+            "name": mode,
         },
     )
     text_table = wandb.Table(columns=["iter", "loss", "text"])
 
-def sample(batch):
+def sample_batch(batch):
     with torch.no_grad():
         if len(batch[0]) > 1:
             print(f"Sample batch size is large ({len(batch[0])})! Is this really what we want?")
@@ -329,19 +333,19 @@ def sample(batch):
                             eos_token_id=pipe.decoder_tokenizer.eos_token_id, device=accelerator.device,
                             suffix_input_ids=suffix_input_ids
                             )[0]
-        print("DECODED TOKENS", decoded_tokens)
         decoded_text = pipe.decoder_tokenizer.batch_decode(decoded_tokens)
     return decoded_text
 
-iter_val_loader = iter(val_loader)
-
-if args.sample_and_exit:
-    save_path = os.path.join(args.work_dir, 'captions.json')
+def sample_and_evaluate(n_images, step=None):
+    if step is None:
+        save_path = os.path.join(args.work_dir, 'captions.json')
+    else:
+        save_path = os.path.join(args.work_dir, f'captions_{step}.json')
     print("Saving to", save_path)
     json_list = []
-    progbar = tqdm(val_loader)
+    progbar = tqdm(val_loader, total=n_images)
     for i, batch in enumerate(progbar):
-        decoded_text = sample(batch)[0]
+        decoded_text = sample_batch(batch)[0]
         
         caption = decoded_text.strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '').strip()
         image_id = batch[-1]['image_id'].item() #if 'image_id' in batch[-1] else 0
@@ -351,6 +355,20 @@ if args.sample_and_exit:
         if (i + 1) % 100 == 0:
             with open(save_path, 'w') as f:
                 json.dump(json_list, f)
+        
+        if i == n_images:
+            break
+
+    with open(save_path, 'w') as f:
+        json.dump(json_list, f)
+
+    print("Finished sampling. Beginning evaluation.")
+    return get_metrics(save_path)
+
+iter_val_loader = iter(val_loader)
+
+if args.sample_and_exit:
+    output = sample_and_evaluate(n_images=5000)
 else:
     if args.pretrain_adapter:
         gradient_fixer = GradientFixer(pipe.text_decoder, pipe.decoder_tokenizer)
@@ -399,7 +417,7 @@ else:
             lr_scheduler.step()
             
             if accelerator.is_main_process:
-                wandb.log({"loss": accelerator.gather(loss).detach().cpu().mean()}, step=step)
+                log = {"loss": accelerator.gather(loss).detach().cpu().mean()}
             losses.append(accelerator.gather(loss).detach().cpu())
             assert losses
             progbar.set_description(f"loss: {torch.stack(losses).mean().item():.3f}, lr: {get_lr(optimizer)}")
@@ -412,9 +430,12 @@ else:
                 elif (step + 1) % 1000 == 0:
                     pipe = unwrap(accelerator, pipe)
                     pipe.save_pretrained(f'{args.work_dir}/current/')
+                    output = sample_and_evaluate(n_images=100, step=step)
+                    print("Output:", output)
+                    log.update(output)
 
                 batch = next(iter_val_loader)
-                decoded_text = sample(batch)
+                decoded_text = sample_batch(batch)
                 print(
                     f"Recon: {decoded_text[0].strip('!').replace('<|endoftext|>', '').replace('<|EOS|>', '')} | "
                     f"True: {batch[1][0]}"
@@ -424,10 +445,11 @@ else:
                     print(f"Layer logits: {layer_logits}")
 
                 losses = []
-                if accelerator.is_main_process:
-                    text_table.add_data(step, loss, decoded_text[0]) 
+                text_table.add_data(step + 1, loss, decoded_text[0]) 
             
-            step += 1
+            if accelerator.is_main_process:
+                step += 1
+                wandb.log(log, step=step)
     
-if accelerator.is_main_process:
-    run.log({"training_samples" : text_table})
+    if accelerator.is_main_process:
+        run.log({"training_samples" : text_table})
