@@ -108,13 +108,12 @@ class GradientFixer:
             mask[token_id, :] = 1.
         self.gradient_mask = mask
 
+    def set_trainable(self, trainable=True):
         for n, p in self.decoder.named_parameters():
             if 'wte' in n or 'prefix' in n:
                 p.requires_grad = True
-                # print(f"Training {n}.")
             else:
-                p.requires_grad = False
-                # print(f"Not training {n}.")
+                p.requires_grad = trainable
 
     def __getattr__(self, name):
         """
@@ -455,6 +454,48 @@ class EmbedAdapterV3(EmbedAdapter):
         else:
             return x
 
+class EmbedAdapterV4(EmbedAdapter):
+    @register_to_config
+    def __init__(self, input_dim, output_dim, output_length=-1, n_heads=16,
+                 use_attn=False, embed_pool=False, dropout=0., n_layers=4):
+        super().__init__(input_dim=input_dim, output_dim=output_dim, output_length=output_length)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.output_length = output_length
+        self.embed_pool = embed_pool
+
+        self.queries = torch.nn.Parameter(torch.randn(size=(1, output_length, output_dim)) * 0.01)
+        self.layers = torch.nn.ModuleList(
+            [BasicTransformerBlock(
+            dim=output_dim, 
+            num_attention_heads=n_heads,
+            attention_head_dim=output_dim // n_heads,
+            dropout=dropout,
+            cross_attention_dim=input_dim,
+            positional_embeddings=True,
+            num_positional_embeddings=output_length
+            )
+            for _ in range(n_layers)]
+        )
+
+        assert output_length > -1
+
+    def forward(self, x, x_pooled=None):
+        if self.embed_pool:
+            x = torch.cat([x, x_pooled], axis=1)
+
+        h = self.queries.tile(x.shape[0], 1, 1)
+
+        for layer in self.layers:
+            h = h + layer(h, encoder_hidden_states=x)
+
+        if self.embed_pool:
+            x, x_pooled = x[:, :-1], x[:, -1:]
+        
+        if self.embed_pool:
+            return x, x_pooled
+        else:
+            return x
 
 class SoftPrompter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
     @register_to_config

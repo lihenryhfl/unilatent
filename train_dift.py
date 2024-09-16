@@ -21,7 +21,7 @@ from transformers import (
 from caption_decoder import TextDecoder as TextDecoderV0
 from caption_decoder_v1 import TextDecoder
 from utils import AttentionLayerAggregator, LayerAggregator, GradientFixer, SoftPrompter, get_suffix_ids, get_dataloader, unwrap, get_metrics
-from utils import EmbedAdapterV1, EmbedAdapterV2, EmbedAdapterV3
+from utils import EmbedAdapterV1, EmbedAdapterV2, EmbedAdapterV3, EmbedAdapterV4
 
 from orig_transformer import SD3Transformer2DModel
 
@@ -37,7 +37,7 @@ parser.add_argument('--n_agg', type=int, default=1)
 parser.add_argument('--block_num', nargs='+', type=int, default='12')
 parser.add_argument('--image_size', type=int, default=-1)
 parser.add_argument('--step_offset', type=int, default=0)
-parser.add_argument('--n_steps', type=int, default=200_000)
+parser.add_argument('--n_steps', type=int, default=500_000)
 parser.add_argument('--lr', type=float, default=2e-5)
 parser.add_argument('--sample_and_exit', action='store_true')
 parser.add_argument('--debug', action='store_true')
@@ -46,9 +46,8 @@ parser.add_argument('--clip_text', action='store_true')
 parser.add_argument('--adapter_type', default='')
 parser.add_argument('--wandb_project', default='dift_v1')
 parser.add_argument('--mode_suffix', default='')
-parser.add_argument('--pretrain', action='store_true')
+parser.add_argument('--pretrain_iters', type=int, default=50_000)
 parser.add_argument('--layer_aggregator', type=str, default='attention')
-parser.add_argument('--pretrain_adapter', action='store_true')
 parser.add_argument('--soft_prompter', action='store_true')
 parser.add_argument('--flux', action='store_true')
 parser.add_argument('--textv0', action='store_true')
@@ -166,6 +165,8 @@ else:
         dift_image_encoder_adapter = EmbedAdapterV2(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
     elif args.adapter_type == 'v3':
         dift_image_encoder_adapter = EmbedAdapterV3(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
+    elif args.adapter_type == 'v4':
+        dift_image_encoder_adapter = EmbedAdapterV4(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool)
     elif not args.adapter_type or args.adapter_type == 'none' or args.adapter_type == 'v0':
         dift_image_encoder_adapter = None
 
@@ -293,9 +294,6 @@ if accelerator.is_main_process and not args.sample_and_exit:
     else:
         mode = "dift"
 
-    if args.pretrain_adapter:
-        mode = mode + "_pretrain"
-
     mode = mode + args.mode_suffix
 
     run = wandb.init(
@@ -370,14 +368,15 @@ iter_val_loader = iter(val_loader)
 if args.sample_and_exit:
     output = sample_and_evaluate(n_images=5000)
 else:
-    if args.pretrain_adapter:
-        gradient_fixer = GradientFixer(pipe.text_decoder, pipe.decoder_tokenizer)
-
     losses = []
     step = 0
     while step < args.step_offset:
         lr_scheduler.step()
         step += 1
+    
+    gradient_fixer = GradientFixer(pipe.text_decoder, pipe.decoder_tokenizer)
+    gradient_fixer.set_trainable(step > args.pretrain_iters)
+
     while step < num_steps:
         progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
         for batch in progbar:
@@ -406,8 +405,20 @@ else:
             loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt, suffix_input_ids=suffix_input_ids)
             accelerator.backward(loss)
 
-            if args.pretrain_adapter:
+            if step < args.pretrain_iters:
                 gradient_fixer.fix_gradients()
+            elif step == args.pretrain_iters:
+                set_trainable = True
+                gradient_fixer.set_trainable(True)
+                for g in optimizer.param_groups:
+                    g['lr'] = 2e-5
+                lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=optimizer,
+                    num_warmup_steps=0,
+                    num_training_steps=num_steps - step,
+                )
+            else:
+                assert set_trainable
 
             for n, p in pipe.named_parameters():
                 if p.grad is not None:
