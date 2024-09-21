@@ -180,7 +180,8 @@ class UniLatentPipeline(StableDiffusion3Pipeline):
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->text_decoder->clip_image_encoder->transformer->vae"
-    _optional_components = ['image_decoder_adapter', 'image_encoder_adapter', 'soft_prompter', 'layer_aggregator', 'dift_image_encoder_adapter']
+    _optional_components = [
+        'image_decoder_adapter', 'image_encoder_adapter', 'soft_prompter', 'layer_aggregator', 'dift_image_encoder_adapter', 'dift_clip_adapter']
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
 
     def __getattribute__(self, name):
@@ -209,6 +210,7 @@ class UniLatentPipeline(StableDiffusion3Pipeline):
         image_decoder_adapter: EmbedAdapter = None,
         image_encoder_adapter: EmbedAdapter = None,
         dift_image_encoder_adapter: EmbedAdapter = None,
+        dift_clip_adapter: EmbedAdapter = None,
         soft_prompter: SoftPrompter = None,
         layer_aggregator: LayerAggregator = None,
     ):
@@ -235,6 +237,7 @@ class UniLatentPipeline(StableDiffusion3Pipeline):
             image_decoder_adapter=image_decoder_adapter,
             image_encoder_adapter=image_encoder_adapter,
             dift_image_encoder_adapter=dift_image_encoder_adapter,
+            dift_clip_adapter=dift_clip_adapter,
             soft_prompter=soft_prompter,
             layer_aggregator=layer_aggregator,
         )
@@ -463,35 +466,6 @@ class UniLatentPipeline(StableDiffusion3Pipeline):
             return model_output.hidden, target
 
         return model_output.sample, target
-
-    def embed_to_denoiser(self, image, prompt_embeds, pooled_prompt_embeds, index, return_layers=None):
-        latent = self.vae.encode(image.to(self.device)).latent_dist.sample()
-        latent = (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-
-        noise = torch.randn_like(latent)
-
-        # format prompt_embeds correctly
-        B, N, C = prompt_embeds.shape
-        if self._hasattr('image_decoder_adapter'):
-            prompt_embeds, pooled_prompt_embeds = self.image_decoder_adapter(prompt_embeds, pooled_prompt_embeds)
-
-        prompt_embeds = self.format_clip_prompt_embeds(prompt_embeds)
-        pooled_prompt_embeds = pooled_prompt_embeds.reshape(B, C)
-        
-        noisy_latent, timestep, target = self._scale_noise(latent, index, noise)
-        model_output = self.transformer(
-                    hidden_states=noisy_latent,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
-                    joint_attention_kwargs=None,
-                    # return_layers=return_layers
-                )
-
-        if return_layers:
-            return model_output.hidden, target
-
-        return model_output.sample, target
         
     def diffusion_step(self, image, prompt, index):
         prompt_embeds, pooled_prompt_embeds = self.encode_text(prompt)
@@ -580,7 +554,11 @@ class UniLatentPipeline(StableDiffusion3Pipeline):
         hidden = hidden[:, :prefix_length]
         
         # basic conversion to work with our framework
-        return hidden[:, :-1], hidden[:, -1:]
+        embeds, pooled_embeds = hidden[:, :-1], hidden[:, -1:]
+        if self._hasattr('dift_clip_adapter'):
+            return self.dift_clip_adapter(embeds, pooled_embeds)
+        else:
+            return embeds, pooled_embeds
 
     def _hasattr(self, name):
         if not hasattr(self, name):

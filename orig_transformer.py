@@ -116,8 +116,6 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                 for i in range(self.config.num_layers)
             ]
         )
-        print("HEY", self.inner_dim, self.config.num_attention_heads, self.config.attention_head_dim)
-
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 

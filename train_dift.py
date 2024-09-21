@@ -44,13 +44,16 @@ parser.add_argument('--debug', action='store_true')
 parser.add_argument('--clip', action='store_true')
 parser.add_argument('--clip_text', action='store_true')
 parser.add_argument('--adapter_type', default='')
-parser.add_argument('--wandb_project', default='dift_v1')
+parser.add_argument('--wandb_project', default='dift_v2')
 parser.add_argument('--mode_suffix', default='')
 parser.add_argument('--pretrain_iters', type=int, default=50_000)
+parser.add_argument('--dift_clip_adapter_iters', type=int, default=0)
 parser.add_argument('--layer_aggregator', type=str, default='attention')
 parser.add_argument('--soft_prompter', action='store_true')
+parser.add_argument('--unfreeze_dift', action='store_true')
 parser.add_argument('--flux', action='store_true')
 parser.add_argument('--textv0', action='store_true')
+parser.add_argument('--adapter_layers', type=int, default=4)
 args = parser.parse_args()
 
 assert not (args.clip_text and args.clip)
@@ -125,7 +128,7 @@ else:
         print("USING IMAGE SIZE", args.image_size)
         prefix_length = int(args.image_size ** 2 / 16 ** 2)
 
-    if args.clip:
+    if args.clip or args.dift_clip_adapter_iters > 0:
         prefix_length = 259
         prefix_dim = 1024
         embed_pool = True
@@ -158,17 +161,19 @@ else:
     transformer.load_state_dict(pipe.transformer.state_dict())
     pipe.transformer = transformer
 
-    soft_prompter = image_encoder_adapter = None
-    if args.adapter_type == 'v1':
+    dift_clip_adapter = dift_image_encoder_adapter = soft_prompter = image_encoder_adapter = None
+    if args.dift_clip_adapter_iters > 0:
+        dift_clip_adapter = EmbedAdapterV4(model_dim, prefix_dim, prefix_length - 1, embed_pool=True)
+    elif args.adapter_type == 'v1':
         dift_image_encoder_adapter = EmbedAdapterV1(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool)
     elif args.adapter_type == 'v2':
         dift_image_encoder_adapter = EmbedAdapterV2(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
     elif args.adapter_type == 'v3':
         dift_image_encoder_adapter = EmbedAdapterV3(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, use_attn=True)
     elif args.adapter_type == 'v4':
-        dift_image_encoder_adapter = EmbedAdapterV4(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool)
+        dift_image_encoder_adapter = EmbedAdapterV4(prefix_dim, prefix_dim, prefix_length - 1, embed_pool=embed_pool, n_layers=args.adapter_layers)
     elif not args.adapter_type or args.adapter_type == 'none' or args.adapter_type == 'v0':
-        dift_image_encoder_adapter = None
+        pass
 
     layer_aggregator = None
     if args.layer_aggregator == 'attention':
@@ -180,7 +185,7 @@ else:
         raise NotImplementedError
 
     if args.soft_prompter:
-        soft_prompter = SoftPrompter(2048, 33)
+        soft_prompter = SoftPrompter(2048, 77)
         
     pipe = UniLatentPipeline(
         transformer=pipe.transformer,
@@ -196,7 +201,8 @@ else:
         decoder_tokenizer=pipe.decoder_tokenizer,
         dift_image_encoder_adapter=dift_image_encoder_adapter,
         soft_prompter=soft_prompter,
-        layer_aggregator=layer_aggregator
+        layer_aggregator=layer_aggregator,
+        dift_clip_adapter=dift_clip_adapter
     )
 
 # also re-initialize transformer
@@ -232,9 +238,15 @@ if args.layer_aggregator:
 if args.soft_prompter:
     models.append(pipe.soft_prompter)
 
+if args.unfreeze_dift:
+    models.append(pipe.transformer)
+
+if args.dift_clip_adapter_iters > 0:
+    models.append(pipe.dift_clip_adapter)
+
 lr = args.lr
 
-num_steps = args.n_steps
+num_steps = args.n_steps + args.step_offset + args.dift_clip_adapter_iters + args.pretrain_iters
 optimizer = torch.optim.AdamW(lr=lr, params=pipe.parameters(models=models))
 lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
@@ -375,7 +387,7 @@ else:
         step += 1
     
     gradient_fixer = GradientFixer(pipe.text_decoder, pipe.decoder_tokenizer)
-    gradient_fixer.set_trainable(step > args.pretrain_iters)
+    gradient_fixer.set_trainable(step > args.pretrain_iters + args.dift_clip_adapter_iters)
 
     while step < num_steps:
         progbar = tqdm(dataloader, disable=not accelerator.is_main_process)
@@ -400,14 +412,26 @@ else:
                     embeds = pooled_embeds = None
 
                 embeds, pooled_embeds = pipe.dift_features(image, index, return_layers=args.block_num, 
-                    dataset_conditioning=True, num_aggregation_steps=args.n_agg, embed=embeds, pooled_embed=pooled_embeds)
-
-            loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt, suffix_input_ids=suffix_input_ids)
+                    dataset_conditioning=True, num_aggregation_steps=args.n_agg, 
+                    embed=embeds, pooled_embed=pooled_embeds)
+            
+            if step < args.dift_clip_adapter_iters:
+                clip_embeds, clip_pooled_embeds = pipe.encode_image(image, dtype=torch.float16)
+                loss_fn = lambda x, y: ((x - y) ** 2).mean(axis=(1, 2)).mean()
+                embeds_loss = loss_fn(embeds, clip_embeds)
+                pooled_embeds_loss = loss_fn(pooled_embeds, clip_pooled_embeds)
+                loss = embeds_loss + pooled_embeds_loss
+                embeds_loss = accelerator.gather(embeds_loss).detach().cpu().mean()
+                pooled_embeds_loss = accelerator.gather(pooled_embeds_loss).detach().cpu().mean()
+            else:
+                loss = pipe.embed_to_decoder(embeds, pooled_embeds, prompt, suffix_input_ids=suffix_input_ids)
+                embeds_loss = pooled_embeds_loss = 0.
             accelerator.backward(loss)
 
-            if step < args.pretrain_iters:
+            loss = accelerator.gather(loss).detach().cpu().mean()
+            if step < args.dift_clip_adapter_iters + args.pretrain_iters:
                 gradient_fixer.fix_gradients()
-            elif step == args.pretrain_iters:
+            elif step == args.pretrain_iters + args.dift_clip_adapter_iters:
                 set_trainable = True
                 gradient_fixer.set_trainable(True)
                 for g in optimizer.param_groups:
@@ -428,8 +452,12 @@ else:
             lr_scheduler.step()
             
             if accelerator.is_main_process:
-                log = {"loss": accelerator.gather(loss).detach().cpu().mean()}
-            losses.append(accelerator.gather(loss).detach().cpu())
+                log = {
+                    "loss": loss,
+                    "embeds_loss": embeds_loss,
+                    "pooled_embeds_loss": pooled_embeds_loss,
+                    }
+            losses.append(loss)
             assert losses
             progbar.set_description(f"loss: {torch.stack(losses).mean().item():.3f}, lr: {get_lr(optimizer)}")
 

@@ -107,6 +107,7 @@ class GradientFixer:
         for token, token_id in tokenizer.get_added_vocab().items():
             mask[token_id, :] = 1.
         self.gradient_mask = mask
+        self.warn_iters = 100
 
     def set_trainable(self, trainable=True):
         for n, p in self.decoder.named_parameters():
@@ -133,13 +134,12 @@ class GradientFixer:
                     if p.grad is not None:
                         self.gradient_mask = self.gradient_mask.to(p.device)
                         p.grad *= self.gradient_mask
-                    else:
+                    elif self.warn_iters > 0:
+                        self.warn_iters -= 1
                         print(f"In FrozenDecoderTrainableDataTokenWrapper: {n} has no gradient!")
                 else:
                     if 'prefix' not in n:
                         assert not p.requires_grad, f"{n}"
-                    
-
 
 class MultiHeadCrossAttention(nn.Module):
     def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0.,
@@ -465,6 +465,7 @@ class EmbedAdapterV4(EmbedAdapter):
         self.embed_pool = embed_pool
 
         self.queries = torch.nn.Parameter(torch.randn(size=(1, output_length, output_dim)) * 0.01)
+        print(f"Initializing EmbedAdapterV4 input_dim: {input_dim}, output_dim: {output_dim}")
         self.layers = torch.nn.ModuleList(
             [BasicTransformerBlock(
             dim=output_dim, 
@@ -490,12 +491,12 @@ class EmbedAdapterV4(EmbedAdapter):
             h = h + layer(h, encoder_hidden_states=x)
 
         if self.embed_pool:
-            x, x_pooled = x[:, :-1], x[:, -1:]
+            x, x_pooled = h[:, :-1], h[:, -1:]
         
         if self.embed_pool:
             return x, x_pooled
         else:
-            return x
+            return h
 
 class SoftPrompter(ModelMixin, ConfigMixin, ModuleUtilsMixin):
     @register_to_config
